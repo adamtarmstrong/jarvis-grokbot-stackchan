@@ -1,0 +1,10 @@
+# Copy to .dev.vars for `wrangler dev`. .dev.vars is gitignored.
+# Every value here is a placeholder. Do not put a real key in this file.
+XAI_API_KEY=YOUR_XAI_API_KEY
+JARVIS_WEBHOOK_KEY=YOUR_WEBHOOK_KEY
+JARVIS_WEBHOOK_URL=https://webhook.example/automations/webhook/YOUR_WEBHOOK_ID
+DEVICE_TOKEN_HASH=YOUR_DEVICE_TOKEN_SHA256_HEX
+DEVICE_HMAC_KEY=YOUR_DEVICE_HMAC_KEY
+DEVICE_ID=YOUR_DEVICE_ID
+PATH_PREFIX=YOUR_RANDOM_PATH_PREFIX
+PUBLIC_BASE_URL=https://YOUR_WORKER.example

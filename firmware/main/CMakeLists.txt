@@ -1,0 +1,41 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "gates.cpp"
+        "eye_view.cpp"
+        "privacy_hw.cpp"
+        "head.cpp"
+        "lip_sync.cpp"
+        "worker_link.cpp"
+        "xai_voice.cpp"
+        "wake_word.cpp"
+        "portal.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES
+        jarvis_logic
+        jarvis_eye
+        scs_servo
+        groki_motion
+        servo_limits
+        stackchan_board
+        m5stack__M5Unified
+        espressif__esp-sr
+        espressif__esp-dsp
+        json
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_server
+        esp_http_client
+        esp_websocket_client
+        mbedtls
+        app_update
+        esp_https_ota
+        wifi_provisioning
+        bt
+        esp_timer
+        driver
+        lwip
+)
+target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)

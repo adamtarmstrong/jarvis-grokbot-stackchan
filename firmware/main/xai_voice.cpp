@@ -1,0 +1,520 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jarvis contributors
+//
+// UNTESTED against a live xAI session. Event names follow the Voice Agent
+// schema checked on 2026-10-19 (session.update, input_audio_buffer.append,
+// response.output_audio.delta, response.function_call_arguments.done).
+// client_secrets does not accept a voice, so the voice is set here.
+
+#include "link.hpp"
+#include "runtime.hpp"
+#include "b64.hpp"
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <M5Unified.h>
+#include <cJSON.h>
+#include <esp_crt_bundle.h>
+#include <esp_log.h>
+#include <esp_websocket_client.h>
+
+namespace jarvis {
+
+namespace {
+constexpr const char* kTag = "voice";
+
+struct SpeakItem {
+    std::string text;
+    std::string request_id;
+};
+
+std::mutex g_mu;
+std::deque<SpeakItem> g_speak;
+std::atomic<bool> g_want{false};
+std::atomic<bool> g_interrupt{false};
+std::atomic<bool> g_connected{false};
+std::atomic<bool> g_turn_done{false};
+std::atomic<bool> g_started{false};
+esp_websocket_client_handle_t g_xai = nullptr;
+std::string g_secret_header;
+std::string g_realtime_url;
+std::string g_voice = "leo";
+std::int64_t g_expires_at = 0;
+bool g_need_update = false;
+std::string g_rx;
+std::string g_active_reply;
+bool g_spoke = false;
+
+struct ToolCall {
+    bool pending = false;
+    std::string call_id;
+    std::string name;
+    std::string arguments;
+};
+ToolCall g_tool;
+
+std::mutex g_pcm_mu;
+std::deque<std::int16_t> g_pcm;
+
+void send_xai(const char* json)
+{
+    if (g_xai == nullptr || json == nullptr) return;
+    if (!esp_websocket_client_is_connected(g_xai)) return;
+    esp_websocket_client_send_text(g_xai, json, static_cast<int>(std::strlen(json)), pdMS_TO_TICKS(1000));
+}
+
+void queue_pcm(const std::uint8_t* data, std::size_t len)
+{
+    if (len < 2) return;
+    std::lock_guard<std::mutex> lock(g_pcm_mu);
+    const std::size_t samples = len / 2;
+    for (std::size_t i = 0; i < samples; ++i) {
+        if (g_pcm.size() >= 16000) g_pcm.pop_front();
+        const auto lo = data[i * 2];
+        const auto hi = data[i * 2 + 1];
+        g_pcm.push_back(static_cast<std::int16_t>(lo | (hi << 8)));
+    }
+}
+
+void note_audio_delta(const cJSON* root)
+{
+    const cJSON* delta = cJSON_GetObjectItemCaseSensitive(root, "delta");
+    if (!cJSON_IsString(delta)) return;
+    const auto pcm = b64_decode(delta->valuestring);
+    queue_pcm(pcm.data(), pcm.size());
+    g_spoke = true;
+    runtime().speaking.store(true);
+    runtime().face.store(FaceState::Speaking);
+}
+
+void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
+{
+    if (id == WEBSOCKET_EVENT_CONNECTED) {
+        g_connected.store(true);
+        g_need_update = true;
+        return;
+    }
+    if (id == WEBSOCKET_EVENT_DISCONNECTED) {
+        g_connected.store(false);
+        return;
+    }
+    if (id != WEBSOCKET_EVENT_DATA || data == nullptr) return;
+    const auto* evt = static_cast<esp_websocket_event_data_t*>(data);
+    if (evt->op_code != 0x1 || evt->data_ptr == nullptr || evt->data_len <= 0) return;
+    if (evt->payload_offset == 0) g_rx.clear();
+    if (g_rx.size() + static_cast<std::size_t>(evt->data_len) > 16384) {
+        g_rx.clear();
+        return;
+    }
+    g_rx.append(evt->data_ptr, static_cast<std::size_t>(evt->data_len));
+    if (evt->payload_offset + evt->data_len < evt->payload_len) return;
+
+    cJSON* root = cJSON_ParseWithLength(g_rx.c_str(), g_rx.size());
+    g_rx.clear();
+    if (root == nullptr) return;
+    const cJSON* type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    if (!cJSON_IsString(type)) {
+        cJSON_Delete(root);
+        return;
+    }
+    const char* name = type->valuestring;
+    // Log the event name only. Deltas and transcripts stay off the console.
+    if (std::strcmp(name, "response.output_audio.delta") == 0 || std::strcmp(name, "response.audio.delta") == 0) {
+        note_audio_delta(root);
+    } else if (std::strcmp(name, "session.created") == 0 || std::strcmp(name, "conversation.created") == 0) {
+        g_need_update = true;
+        ESP_LOGI(kTag, "%s", name);
+    } else if (std::strcmp(name, "session.updated") == 0) {
+        g_need_update = false;
+        runtime().face.store(FaceState::Listening);
+        ESP_LOGI(kTag, "session.updated");
+    } else if (std::strcmp(name, "input_audio_buffer.speech_started") == 0) {
+        runtime().face.store(FaceState::Listening);
+    } else if (std::strcmp(name, "input_audio_buffer.speech_stopped") == 0) {
+        runtime().face.store(FaceState::Thinking);
+    } else if (std::strcmp(name, "response.created") == 0) {
+        runtime().face.store(FaceState::Thinking);
+    } else if (std::strcmp(name, "response.function_call_arguments.done") == 0) {
+        const cJSON* call_id = cJSON_GetObjectItemCaseSensitive(root, "call_id");
+        const cJSON* fn = cJSON_GetObjectItemCaseSensitive(root, "name");
+        const cJSON* args = cJSON_GetObjectItemCaseSensitive(root, "arguments");
+        if (cJSON_IsString(call_id) && cJSON_IsString(fn) && cJSON_IsString(args)) {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_tool.pending = true;
+            g_tool.call_id = call_id->valuestring;
+            g_tool.name = fn->valuestring;
+            g_tool.arguments = args->valuestring;
+        }
+    } else if (std::strcmp(name, "response.done") == 0 || std::strcmp(name, "response.output_audio.done") == 0) {
+        if (std::strcmp(name, "response.done") == 0) g_turn_done.store(true);
+        ESP_LOGI(kTag, "%s", name);
+    } else if (std::strcmp(name, "error") == 0) {
+        ESP_LOGW(kTag, "realtime error event");
+    }
+    cJSON_Delete(root);
+}
+
+bool mint_secret()
+{
+    DeviceConfig cfg;
+    if (!config_load(cfg)) {
+        ESP_LOGW(kTag, "no device config");
+        return false;
+    }
+    std::string body;
+    if (!worker_post(cfg, "/token", "{}", body)) return false;
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) return false;
+    const cJSON* secret = cJSON_GetObjectItemCaseSensitive(root, "client_secret");
+    const cJSON* url = cJSON_GetObjectItemCaseSensitive(root, "realtime_url");
+    const cJSON* voice = cJSON_GetObjectItemCaseSensitive(root, "voice");
+    const cJSON* exp = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    const bool ok = cJSON_IsString(secret) && secret->valuestring[0] != '\0';
+    if (ok) {
+        g_secret_header = std::string("Authorization: Bearer ") + secret->valuestring + "\r\n";
+        g_realtime_url = cJSON_IsString(url) ? url->valuestring : "wss://api.x.ai/v1/realtime?model=grok-voice-3.0";
+        if (cJSON_IsString(voice) && voice->valuestring[0] != '\0') g_voice = voice->valuestring;
+        g_expires_at = cJSON_IsNumber(exp) ? static_cast<std::int64_t>(exp->valuedouble) : 0;
+    }
+    cJSON_Delete(root);
+    ESP_LOGI(kTag, "token mint %s", ok ? "ok" : "rejected");
+    return ok;
+}
+
+void send_session_update()
+{
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "session.update");
+    cJSON* session = cJSON_AddObjectToObject(root, "session");
+    cJSON_AddStringToObject(session, "instructions",
+                            "You are Jarvis, a desk robot. Speak in one to three short sentences. "
+                            "No markdown and no URLs. For anything that needs the owner's other bots "
+                            "or a longer lookup, call ask_bot and then wait.");
+    cJSON_AddStringToObject(session, "voice", g_voice.c_str());
+    cJSON* vad = cJSON_AddObjectToObject(session, "turn_detection");
+    cJSON_AddStringToObject(vad, "type", "server_vad");
+    cJSON* audio = cJSON_AddObjectToObject(session, "audio");
+    cJSON* in = cJSON_AddObjectToObject(audio, "input");
+    cJSON* in_fmt = cJSON_AddObjectToObject(in, "format");
+    cJSON_AddStringToObject(in_fmt, "type", "audio/pcm");
+    cJSON_AddNumberToObject(in_fmt, "rate", 16000);
+    cJSON* out = cJSON_AddObjectToObject(audio, "output");
+    cJSON* out_fmt = cJSON_AddObjectToObject(out, "format");
+    cJSON_AddStringToObject(out_fmt, "type", "audio/pcm");
+    cJSON_AddNumberToObject(out_fmt, "rate", 16000);
+    cJSON* tools = cJSON_AddArrayToObject(session, "tools");
+    cJSON* web = cJSON_CreateObject();
+    cJSON_AddStringToObject(web, "type", "web_search");
+    cJSON_AddItemToArray(tools, web);
+    cJSON* x = cJSON_CreateObject();
+    cJSON_AddStringToObject(x, "type", "x_search");
+    cJSON_AddItemToArray(tools, x);
+    cJSON* fn = cJSON_CreateObject();
+    cJSON_AddStringToObject(fn, "type", "function");
+    cJSON_AddStringToObject(fn, "name", "ask_bot");
+    cJSON_AddStringToObject(fn, "description", "Hand a question to the owner's Jarvis bot.");
+    cJSON* params = cJSON_AddObjectToObject(fn, "parameters");
+    cJSON_AddStringToObject(params, "type", "object");
+    cJSON* props = cJSON_AddObjectToObject(params, "properties");
+    cJSON* task = cJSON_AddObjectToObject(props, "task");
+    cJSON_AddStringToObject(task, "type", "string");
+    cJSON* required = cJSON_AddArrayToObject(params, "required");
+    cJSON_AddItemToArray(required, cJSON_CreateString("task"));
+    cJSON_AddItemToArray(tools, fn);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed != nullptr) {
+        send_xai(printed);
+        cJSON_free(printed);
+    }
+}
+
+bool open_realtime()
+{
+    if (g_secret_header.empty() && !mint_secret()) return false;
+    esp_websocket_client_config_t ws = {};
+    ws.uri = g_realtime_url.c_str();
+    ws.headers = g_secret_header.c_str();
+    ws.buffer_size = 8192;
+    ws.crt_bundle_attach = esp_crt_bundle_attach;
+    ws.network_timeout_ms = 10000;
+    g_xai = esp_websocket_client_init(&ws);
+    if (g_xai == nullptr) return false;
+    esp_websocket_register_events(g_xai, WEBSOCKET_EVENT_ANY, xai_event, nullptr);
+    if (esp_websocket_client_start(g_xai) != ESP_OK) {
+        esp_websocket_client_destroy(g_xai);
+        g_xai = nullptr;
+        return false;
+    }
+    ESP_LOGI(kTag, "realtime connecting");
+    return true;
+}
+
+void close_realtime()
+{
+    g_connected.store(false);
+    if (g_xai != nullptr) {
+        esp_websocket_client_stop(g_xai);
+        esp_websocket_client_destroy(g_xai);
+        g_xai = nullptr;
+    }
+    g_secret_header.clear();
+    cJSON* end = cJSON_CreateObject();
+    cJSON_AddStringToObject(end, "type", "session_end");
+    char* printed = cJSON_PrintUnformatted(end);
+    cJSON_Delete(end);
+    if (printed != nullptr) {
+        worker_send_text(printed);
+        cJSON_free(printed);
+    }
+    runtime().speaking.store(false);
+    runtime().face.store(FaceState::Idle);
+}
+
+void mark_played_if_spoken()
+{
+    if (g_active_reply.empty() || !g_spoke) return;
+    cJSON* ack = cJSON_CreateObject();
+    cJSON_AddStringToObject(ack, "type", "state");
+    cJSON_AddStringToObject(ack, "request_id", g_active_reply.c_str());
+    cJSON_AddStringToObject(ack, "state", "played");
+    char* printed = cJSON_PrintUnformatted(ack);
+    cJSON_Delete(ack);
+    if (printed != nullptr) {
+        worker_send_text(printed);
+        cJSON_free(printed);
+    }
+    g_active_reply.clear();
+    g_spoke = false;
+}
+
+void inject_text(const SpeakItem& item)
+{
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "conversation.item.create");
+    cJSON* msg = cJSON_AddObjectToObject(root, "item");
+    cJSON_AddStringToObject(msg, "type", "message");
+    cJSON_AddStringToObject(msg, "role", "user");
+    cJSON* content = cJSON_AddArrayToObject(msg, "content");
+    cJSON* part = cJSON_CreateObject();
+    cJSON_AddStringToObject(part, "type", "input_text");
+    const std::string prompt = "Say this to the person in one to three sentences, with no markdown and no URLs: " + item.text;
+    cJSON_AddStringToObject(part, "text", prompt.c_str());
+    cJSON_AddItemToArray(content, part);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed != nullptr) {
+        send_xai(printed);
+        cJSON_free(printed);
+    }
+    send_xai("{\"type\":\"response.create\"}");
+    g_active_reply = item.request_id;
+    g_spoke = false;
+    runtime().face.store(FaceState::Thinking);
+}
+
+void answer_tool()
+{
+    ToolCall call;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (!g_tool.pending) return;
+        call = g_tool;
+        g_tool.pending = false;
+    }
+    std::string task = call.arguments;
+    cJSON* args = cJSON_Parse(call.arguments.c_str());
+    if (args != nullptr) {
+        const cJSON* field = cJSON_GetObjectItemCaseSensitive(args, "task");
+        if (!cJSON_IsString(field)) field = cJSON_GetObjectItemCaseSensitive(args, "text");
+        if (cJSON_IsString(field)) task = field->valuestring;
+        cJSON_Delete(args);
+    }
+    if (task.size() > 2000) task.resize(2000);
+    DeviceConfig cfg;
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "text", task.c_str());
+    cJSON_AddBoolToObject(body, "interrupt", g_interrupt.exchange(false));
+    char* printed = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    std::string response;
+    bool posted = false;
+    if (printed != nullptr && config_load(cfg)) posted = worker_post(cfg, "/ask", printed, response);
+    if (printed != nullptr) cJSON_free(printed);
+    ESP_LOGI(kTag, "ask_bot %s", posted ? "sent" : "failed");
+
+    cJSON* out = cJSON_CreateObject();
+    cJSON_AddStringToObject(out, "type", "conversation.item.create");
+    cJSON* item = cJSON_AddObjectToObject(out, "item");
+    cJSON_AddStringToObject(item, "type", "function_call_output");
+    cJSON_AddStringToObject(item, "call_id", call.call_id.c_str());
+    cJSON_AddStringToObject(item, "output", posted ? "{\"status\":\"sent\"}" : "{\"status\":\"failed\"}");
+    char* out_json = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    if (out_json != nullptr) {
+        send_xai(out_json);
+        cJSON_free(out_json);
+    }
+    send_xai("{\"type\":\"response.create\"}");
+    runtime().face.store(FaceState::Thinking);
+}
+
+bool pcm_pending()
+{
+    std::lock_guard<std::mutex> lock(g_pcm_mu);
+    return !g_pcm.empty();
+}
+
+bool tool_pending()
+{
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_tool.pending;
+}
+
+void play_some()
+{
+    std::int16_t chunk[320];
+    std::size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_pcm_mu);
+        n = g_pcm.size() < 320 ? g_pcm.size() : 320;
+        for (std::size_t i = 0; i < n; ++i) {
+            chunk[i] = g_pcm.front();
+            g_pcm.pop_front();
+        }
+    }
+    if (n == 0) {
+        if (!M5.Speaker.isPlaying()) runtime().speaking.store(false);
+        return;
+    }
+    // The wake task owns the microphone. Raising speaking makes it call MicGate::close.
+    runtime().speaking.store(true);
+    runtime().face.store(FaceState::Speaking);
+    M5.Speaker.playRaw(chunk, n, 16000, false);
+    lip_feed(chunk, n);
+}
+
+void voice_task(void*)
+{
+    ESP_LOGW(kTag, "xAI voice task UNTESTED on hardware and against a live session");
+    for (;;) {
+        SpeakItem next;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (!g_speak.empty()) {
+                next = std::move(g_speak.front());
+                g_speak.pop_front();
+                have = true;
+            }
+        }
+        if (!g_want.load() && !have && !tool_pending() && !g_connected.load()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (g_xai == nullptr || !g_connected.load()) {
+            if (!open_realtime()) {
+                if (have) {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    g_speak.push_front(std::move(next));
+                }
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+            for (int i = 0; i < 50 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (g_need_update && g_connected.load()) send_session_update();
+        answer_tool();
+        if (have && g_connected.load() && !g_need_update) inject_text(next);
+        else if (have) {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_speak.push_front(std::move(next));
+        }
+        play_some();
+        if (g_turn_done.load() && !pcm_pending() && !M5.Speaker.isPlaying()) {
+            g_turn_done.store(false);
+            mark_played_if_spoken();
+            if (!runtime().ptt.load()) {
+                runtime().listening.store(false);
+                if (!tool_pending()) g_want.store(false);
+            }
+        }
+        if (!g_want.load() && !runtime().ptt.load() && !tool_pending() && !pcm_pending() && !M5.Speaker.isPlaying()) {
+            bool queued = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                queued = !g_speak.empty();
+            }
+            if (!queued && g_connected.load()) close_realtime();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void ensure_voice_task()
+{
+    bool expected = false;
+    if (g_started.compare_exchange_strong(expected, true)) {
+        xTaskCreatePinnedToCore(voice_task, "voice", 8192, nullptr, 5, nullptr, 0);
+    }
+}
+} // namespace
+
+void speak_text(const std::string& text)
+{
+    speak_reply(text, "");
+}
+
+void speak_reply(const std::string& text, const std::string& request_id)
+{
+    if (text.empty() || text.size() > 2000) return;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_speak.size() >= 4) g_speak.pop_front();
+        g_speak.push_back(SpeakItem{text, request_id});
+    }
+    g_want.store(true);
+    ensure_voice_task();
+}
+
+void voice_start_turn()
+{
+    if (g_want.load()) g_interrupt.store(true);
+    runtime().listening.store(true);
+    runtime().face.store(FaceState::Listening);
+    g_want.store(true);
+    ensure_voice_task();
+}
+
+void voice_stop_turn()
+{
+    runtime().listening.store(false);
+    if (!runtime().ptt.load()) g_want.store(false);
+}
+
+void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
+{
+    if (pcm == nullptr || n == 0 || g_xai == nullptr || !g_connected.load()) return;
+    if (runtime().speaking.load()) return;
+    if (!runtime().ptt.load() && !runtime().listening.load()) return;
+    if (n > 1600) n = 1600;
+    const auto encoded = b64_encode(reinterpret_cast<const std::uint8_t*>(pcm), n * sizeof(std::int16_t));
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
+    cJSON_AddStringToObject(root, "audio", encoded.c_str());
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) return;
+    send_xai(printed);
+    cJSON_free(printed);
+}
+
+} // namespace jarvis

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refuse the commit when gitleaks is missing or finds a secret.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks is not installed. See CONTRIBUTING.md." >&2
+  exit 1
+fi
+gitleaks protect --staged --redact --config .gitleaks.toml

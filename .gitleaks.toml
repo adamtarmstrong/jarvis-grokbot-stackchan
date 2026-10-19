@@ -1,0 +1,14 @@
+title = "Jarvis"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Dependency trees and build output. Tests are scanned."
+paths = [
+  '''(?:^|/)node_modules/''',
+  '''(?:^|/)build/''',
+  '''(?:^|/)dist/''',
+  '''(?:^|/)managed_components/''',
+  '''(?:^|/)\.wrangler/''',
+]

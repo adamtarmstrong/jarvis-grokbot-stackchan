@@ -1,0 +1,26 @@
+# Secrets and local Worker state
+.env*
+!.env.example
+!.dev.vars.example
+.dev.vars
+.wrangler/
+secrets.*
+credentials*
+*.pem
+
+# ESP-IDF. sdkconfig.defaults is the committed config.
+sdkconfig
+sdkconfig.old
+build/
+**/build/
+*.bin
+managed_components/
+dependencies.lock
+
+# Tooling
+node_modules/
+dist/
+
+# Local notes that are not the project
+/uploads/
+/agent-tools/
