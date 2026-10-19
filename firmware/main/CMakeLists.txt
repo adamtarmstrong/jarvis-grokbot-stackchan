@@ -28,7 +28,7 @@ idf_component_register(
         esp_event
         esp_http_server
         esp_http_client
-        esp_websocket_client
+        espressif__esp_websocket_client
         mbedtls
         app_update
         esp_https_ota
