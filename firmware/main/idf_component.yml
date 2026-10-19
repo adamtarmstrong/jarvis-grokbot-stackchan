@@ -5,3 +5,5 @@ dependencies:
   m5stack/M5Unified: ">=0.2.2"
   espressif/esp-sr: "~2.6.0"
   espressif/esp-dsp: "^1.5.0"
+  # Moved out of ESP-IDF in 5.0. The CMake name is espressif__esp_websocket_client.
+  espressif/esp_websocket_client: "^1.6.0"
