@@ -103,6 +103,12 @@ void detect_task(void*)
         const std::int64_t now = esp_timer_get_time() / 1000;
         if (now - last_ms < 1500) continue;
         last_ms = now;
+        // A turn is already open (connecting, listening, or replying). Saying "Jarvis" again
+        // must not restart it or eat the question.
+        if (runtime().listening.load() || runtime().speaking.load() || runtime().ptt.load()) {
+            ESP_LOGI(kTag, "wake word ignored; turn already open");
+            continue;
+        }
         ESP_LOGI(kTag, "wake word");
         voice_start_turn();
     }
