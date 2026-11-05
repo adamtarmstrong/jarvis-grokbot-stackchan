@@ -55,8 +55,8 @@ inline constexpr Rgb kAccents[static_cast<int>(Accent::Count)] = {
     {138, 160, 180}, // slate
 };
 
-// Face theme matches the Grok Bot avatar: black oval eyes on red (#B71C1C).
-inline constexpr Rgb kFaceBackground{183, 28, 28};
+// Face theme matches the Grok Bot avatar: black oval eyes on red (#FC2D3E).
+inline constexpr Rgb kFaceBackground{252, 45, 62};
 inline constexpr Rgb kEyeColor{0, 0, 0};
 // On-screen dots get a black ring so the red mic dot stays visible on the red face.
 inline constexpr Rgb kDotRing{0, 0, 0};
