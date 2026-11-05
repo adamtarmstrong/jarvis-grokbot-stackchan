@@ -22,6 +22,8 @@
 #include <esp_random.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <esp_timer.h>
+#include <cstdint>
 #include <lwip/sockets.h>
 #include <nvs.h>
 #include <nvs_flash.h>
@@ -334,6 +336,49 @@ void portal_start()
     for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+namespace {
+// Reconnect with backoff after a station drop: 1 s doubling to a 30 s cap, reset on a new IP.
+esp_timer_handle_t g_reconnect_timer = nullptr;
+std::uint32_t g_backoff_ms = 1000;
+bool g_sta_handlers = false;
+
+void reconnect_cb(void*)
+{
+    const esp_err_t err = esp_wifi_connect();
+    ESP_LOGI(kTag, "wifi reconnect attempt (%s)", esp_err_to_name(err));
+}
+
+void sta_event(void*, esp_event_base_t base, int32_t id, void* data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        const auto* ev = static_cast<wifi_event_sta_disconnected_t*>(data);
+        ESP_LOGW(kTag, "wifi disconnected (reason %d, rssi %d); retry in %u ms", ev ? ev->reason : -1,
+                 ev ? ev->rssi : 0, static_cast<unsigned>(g_backoff_ms));
+        if (g_reconnect_timer != nullptr) {
+            esp_timer_stop(g_reconnect_timer);
+            esp_timer_start_once(g_reconnect_timer, static_cast<std::uint64_t>(g_backoff_ms) * 1000ULL);
+        }
+        g_backoff_ms = g_backoff_ms * 2 > 30000 ? 30000 : g_backoff_ms * 2;
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        g_backoff_ms = 1000;
+        wifi_ap_record_t info = {};
+        if (esp_wifi_sta_get_ap_info(&info) == ESP_OK) ESP_LOGI(kTag, "wifi up, rssi %d", info.rssi);
+    }
+}
+
+void install_sta_handlers()
+{
+    if (g_sta_handlers) return;
+    esp_timer_create_args_t args = {};
+    args.callback = reconnect_cb;
+    args.name = "wifi_reconn";
+    esp_timer_create(&args, &g_reconnect_timer);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, sta_event, nullptr);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, sta_event, nullptr);
+    g_sta_handlers = true;
+}
+} // namespace
+
 bool wifi_join_saved()
 {
     std::string ssid;
@@ -341,7 +386,7 @@ bool wifi_join_saved()
     if (!load_wifi(ssid, pass)) return false;
     ensure_stack();
     if (!g_wifi_ready) {
-        esp_netif_create_default_wifi_sta();
+        { esp_netif_t* sta_if = esp_netif_create_default_wifi_sta(); if (sta_if != nullptr) esp_netif_set_hostname(sta_if, "Jarvis"); }
         wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
         if (esp_wifi_init(&init) != ESP_OK) return false;
         g_wifi_ready = true;
@@ -354,6 +399,8 @@ bool wifi_join_saved()
         esp_wifi_start() != ESP_OK || esp_wifi_connect() != ESP_OK) {
         return false;
     }
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    install_sta_handlers();
     // UNTESTED. Wait for an address, then give up and let setup run again.
     for (int i = 0; i < 80; ++i) {
         wifi_ap_record_t info = {};

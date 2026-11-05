@@ -1,3 +1,5 @@
+#include <sys/time.h>
+#include <ctime>
 #include "runtime.hpp"
 
 #include <M5Unified.h>
@@ -72,7 +74,20 @@ void eye_start()
 {
     auto cfg = M5.config();
     cfg.clear_display = true;
+    // M5.begin copies the board RTC (unset, year 2000) into the system clock and would
+    // undo SNTP. Keep a synced clock, and write it back to the RTC for the next boot.
+    timeval before = {};
+    gettimeofday(&before, nullptr);
     M5.begin(cfg);
+    if (before.tv_sec > 1767225600) { // after 2026-01-01: SNTP already ran
+        settimeofday(&before, nullptr);
+        if (M5.Rtc.isEnabled()) {
+            const std::time_t now = before.tv_sec;
+            std::tm utc = {};
+            gmtime_r(&now, &utc);
+            M5.Rtc.setDateTime(&utc);
+        }
+    }
     M5.Display.setRotation(1);
     M5.Display.fillScreen(rgb565(kFaceBackground));
     // UNTESTED on a panel. Priority 1 is deliberate; audio tasks use 5.

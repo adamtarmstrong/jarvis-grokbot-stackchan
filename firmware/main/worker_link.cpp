@@ -340,9 +340,9 @@ std::string sign_request(const DeviceConfig& cfg, const char* method, const std:
                          std::size_t len, std::string& timestamp, std::string& nonce)
 {
     const std::time_t now = std::time(nullptr);
-    char stamp[16];
-    std::snprintf(stamp, sizeof(stamp), "%010lld", static_cast<long long>(now));
-    timestamp = stamp;
+    // std::to_string, not "%lld": newlib nano printf drops 64-bit conversions and signed garbage times.
+    timestamp = std::to_string(static_cast<long long>(now));
+    if (timestamp.size() < 10) timestamp.insert(0, 10 - timestamp.size(), '0');
     nonce = random_nonce();
     const std::string hash = sha256_hex(body, len);
     const std::string message = canonical_string(method, path, cfg.device_id, timestamp, nonce, hash);
@@ -404,10 +404,24 @@ void worker_ws_start(const DeviceConfig& cfg)
 bool clock_sync()
 {
     if (g_clock_set) return true;
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    if (esp_netif_sntp_init(&config) != ESP_OK) return false;
+    // Init SNTP once; later calls only wait again (re-init fails with "already initialized").
+    static bool sntp_started = false;
+    if (!sntp_started) {
+        esp_sntp_config_t config =
+            ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(3, ESP_SNTP_SERVER_LIST("time.cloudflare.com", "time.google.com", "pool.ntp.org"));
+        if (esp_netif_sntp_init(&config) != ESP_OK) return false;
+        sntp_started = true;
+    }
     const esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
-    g_clock_set = err == ESP_OK;
+    g_clock_set = err == ESP_OK || std::time(nullptr) > 1767225600; // after 2026-01-01
+    if (g_clock_set) {
+        const std::time_t now = std::time(nullptr);
+        std::tm utc = {};
+        gmtime_r(&now, &utc);
+        char buf[32];
+        std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &utc);
+        ESP_LOGI(kTag, "clock synced: %s", buf);
+    }
     if (!g_clock_set) ESP_LOGW(kTag, "SNTP did not sync; signatures will be rejected");
     return g_clock_set;
 }
