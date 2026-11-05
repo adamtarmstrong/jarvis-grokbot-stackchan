@@ -15,6 +15,8 @@
 #include <freertos/task.h>
 
 #include <M5Unified.h>
+#include <esp_timer.h>
+#include <cmath>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -62,6 +64,27 @@ void feed_task(void*)
         // record() returns before the DMA fills buf. Wait for it, or AFE and xAI get a stale,
         // half-written chunk.
         while (M5.Mic.isRecording()) vTaskDelay(1);
+        {
+            // Idle mic level every ~5 s so a silent or dead mic shows in the log.
+            static std::int64_t last_us = 0;
+            static int peak = 0;
+            static double sum_sq = 0;
+            static std::size_t count = 0;
+            for (int i = 0; i < chunk; ++i) {
+                const int v = buf[i] < 0 ? -buf[i] : buf[i];
+                if (v > peak) peak = v;
+                sum_sq += static_cast<double>(buf[i]) * buf[i];
+            }
+            count += static_cast<std::size_t>(chunk);
+            const std::int64_t now = esp_timer_get_time();
+            if (now - last_us > 5000000) {
+                ESP_LOGI(kTag, "mic level rms %d peak %d", static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak);
+                last_us = now;
+                peak = 0;
+                sum_sq = 0;
+                count = 0;
+            }
+        }
         g_afe->feed(g_afe_data, buf);
         if (runtime().ptt.load() || runtime().listening.load()) voice_feed_pcm(buf, static_cast<std::size_t>(chunk));
     }
