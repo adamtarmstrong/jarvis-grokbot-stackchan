@@ -42,6 +42,8 @@ void privacy_start();
 // Draws the privacy dots. Call only from the eye task, which owns M5.Display.
 void privacy_paint_dots();
 void head_start();
+// Waits up to ms for the PY32 servo power enable; true when servo power is on.
+bool servo_power_wait(int ms);
 void head_submit(float yaw_deg, float pitch_deg);
 
 // 16 kHz mono PCM. The mouth only moves while the speaking flag is set.

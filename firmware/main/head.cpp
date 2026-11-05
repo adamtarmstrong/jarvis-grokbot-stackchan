@@ -4,6 +4,7 @@
 #include <freertos/task.h>
 
 #include <esp_log.h>
+#include <esp_random.h>
 
 #include "groki_motion/motion.hpp"
 #include "scs_servo/scs_bus.hpp"
@@ -35,6 +36,9 @@ void head_task(void*)
     cfg.tx = GPIO_NUM_6;
     cfg.rx = GPIO_NUM_7;
     cfg.baud = 1'000'000;
+    const bool powered = servo_power_wait(3000);
+    ESP_LOGI("head", "servo power %s", powered ? "on" : "NOT on");
+    vTaskDelay(pdMS_TO_TICKS(200));  // let the servo rail settle
     auto bus = ScsBus::create(cfg);
     if (!bus) {
         ESP_LOGE("head", "servo bus did not open");
@@ -43,8 +47,9 @@ void head_task(void*)
     }
     ScsServo yaw(*bus, stackchan::scs_servo::kYawId);
     ScsServo pitch(*bus, stackchan::scs_servo::kPitchId);
-    (void)yaw.ping();
-    (void)pitch.ping();
+    const bool yaw_ok = yaw.ping().has_value();
+    const bool pitch_ok = pitch.ping().has_value();
+    ESP_LOGI("head", "servo bus open; ping yaw %s, pitch %s", yaw_ok ? "ok" : "no reply", pitch_ok ? "ok" : "no reply");
     (void)yaw.enable_torque(true);
     (void)pitch.enable_torque(true);
 
@@ -61,7 +66,19 @@ void head_task(void*)
     pitch_axis.reset(0);
     bool torque = true;
 
+    // Idle look-around: a small random glance every 4-8 s while idle.
+    TickType_t next_glance = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+    uint32_t glances = 0;
     while (true) {
+        if (xTaskGetTickCount() >= next_glance) {
+            next_glance = xTaskGetTickCount() + pdMS_TO_TICKS(4000 + esp_random() % 4000);
+            if (!runtime().listening.load() && runtime().face.load() == FaceState::Idle) {
+                const float y = static_cast<float>(static_cast<int>(esp_random() % 41) - 20);
+                const float p = static_cast<float>(static_cast<int>(esp_random() % 13) - 6);
+                head_submit(y, p);
+                if ((glances++ % 5) == 0) ESP_LOGI("head", "idle glance #%u to yaw %.0f pitch %.0f", (unsigned)glances, y, p);
+            }
+        }
         // Listening pauses tracking. Speaking keeps only the latest command.
         if (!runtime().listening.load() && g_pending.set) {
             yaw_axis.retarget(g_pending.yaw, 200);
