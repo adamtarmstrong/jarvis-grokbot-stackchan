@@ -106,6 +106,16 @@ void eye_start()
             M5.Rtc.setDateTime(&utc);
         }
     }
+    // Speaker self-test before the wake task takes the shared I2S pins for the mic.
+    {
+        const bool began = M5.Speaker.begin();
+        M5.Speaker.setVolume(180);
+        const bool toned = began && M5.Speaker.tone(1000, 150);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI("eye", "boot chime: speaker begin=%d enabled=%d tone=%d", (int)began, (int)M5.Speaker.isEnabled(),
+                 (int)toned);
+        M5.Speaker.end();
+    }
     M5.Display.setRotation(1);
     M5.Display.setBrightness(160);
     M5.Display.fillScreen(rgb565(kFaceBackground));

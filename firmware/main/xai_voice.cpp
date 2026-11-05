@@ -67,14 +67,15 @@ constexpr std::int64_t kListenWindowUs = 8'000'000;
 bool speaker_ready()
 {
     runtime().speaking.store(true);
-    for (int i = 0; i < 30 && M5.Mic.isEnabled(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    int waited = 0;
+    for (; waited < 100 && M5.Mic.isEnabled(); ++waited) vTaskDelay(pdMS_TO_TICKS(10));
     if (M5.Speaker.isEnabled()) return true;
-    if (!M5.Speaker.begin()) {
-        ESP_LOGW(kTag, "speaker did not start");
-        return false;
-    }
+    const bool mic_still_on = M5.Mic.isEnabled();
+    const bool began = M5.Speaker.begin();
+    ESP_LOGI(kTag, "speaker begin=%d enabled=%d mic_on=%d waited_ms=%d", (int)began, (int)M5.Speaker.isEnabled(),
+             (int)mic_still_on, waited * 10);
+    if (!began) return false;
     M5.Speaker.setVolume(180);
-    ESP_LOGI(kTag, "speaker started");
     return true;
 }
 
@@ -531,7 +532,8 @@ void voice_task(void*)
         if (g_ready_beep.exchange(false)) {
             // Ready to hear: chime, then hand the I2S back to the mic and open the listen window.
             if (speaker_ready()) {
-                M5.Speaker.tone(1320, 120);
+                const bool toned = M5.Speaker.tone(1320, 120);
+                ESP_LOGI(kTag, "ready chime tone=%d playing=%d", (int)toned, (int)M5.Speaker.isPlaying());
                 vTaskDelay(pdMS_TO_TICKS(140));
                 M5.Speaker.tone(1760, 120);
                 for (int i = 0; i < 40 && M5.Speaker.isPlaying(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
