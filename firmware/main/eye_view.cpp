@@ -32,9 +32,8 @@ void draw_shape(lgfx::LovyanGFX& gfx, int cx, int cy, const eyes::Shape& shape, 
                                  static_cast<int>(h * 0.25f), 4, color);
         return;
     }
-    // Square eyes to match avatarShape=square. Moods still change w, h, offsets and lids.
-    gfx.fillRoundRect(x - static_cast<int>(shape.w / 2), y - static_cast<int>(h / 2), static_cast<int>(shape.w),
-                      static_cast<int>(h), 6, color);
+    // Tall oval eyes like Grok Bot's. Moods change w, h, offsets and lids.
+    gfx.fillEllipse(x, y, static_cast<int>(shape.w / 2), static_cast<int>(h / 2), color);
     if (shape.lid > 0.0f) {
         const int lid_h = static_cast<int>(h * shape.lid);
         gfx.fillRect(x - static_cast<int>(shape.w / 2) - 2, y - static_cast<int>(h / 2) - 2,
