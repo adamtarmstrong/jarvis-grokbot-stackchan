@@ -5,6 +5,7 @@
 #include <M5Unified.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_log.h>
 
 #include "jarvis/privacy.hpp"
 
@@ -20,21 +21,21 @@ uint16_t rgb565(Rgb c)
     return static_cast<uint16_t>(((c.r & 0xF8) << 8) | ((c.g & 0xFC) << 3) | (c.b >> 3));
 }
 
-void draw_shape(int cx, int cy, const eyes::Shape& shape, uint16_t color, float lip)
+void draw_shape(lgfx::LovyanGFX& gfx, int cx, int cy, const eyes::Shape& shape, uint16_t color, float lip)
 {
     float h = shape.h;
     if (runtime().speaking.load()) h *= 0.72f + 0.45f * lip;
     const int x = cx + static_cast<int>(shape.dx);
     const int y = cy + static_cast<int>(shape.dy);
     if (shape.arc < 0.0f) {
-        M5.Display.fillRoundRect(x - static_cast<int>(shape.w / 2), y, static_cast<int>(shape.w),
+        gfx.fillRoundRect(x - static_cast<int>(shape.w / 2), y, static_cast<int>(shape.w),
                                  static_cast<int>(h * 0.25f), 4, color);
         return;
     }
-    M5.Display.fillEllipse(x, y, static_cast<int>(shape.w / 2), static_cast<int>(h / 2), color);
+    gfx.fillEllipse(x, y, static_cast<int>(shape.w / 2), static_cast<int>(h / 2), color);
     if (shape.lid > 0.0f) {
         const int lid_h = static_cast<int>(h * shape.lid);
-        M5.Display.fillRect(x - static_cast<int>(shape.w / 2) - 2, y - static_cast<int>(h / 2) - 2,
+        gfx.fillRect(x - static_cast<int>(shape.w / 2) - 2, y - static_cast<int>(h / 2) - 2,
                             static_cast<int>(shape.w) + 4, lid_h, rgb565(kFaceBackground));
     }
 }
@@ -43,24 +44,36 @@ void eye_task(void*)
 {
     // Priority stays below the audio tasks. groki-bot found that raising the
     // display task made the speaker stutter. This task is created at priority 1.
+    // The eye band is drawn off screen in PSRAM and pushed in one transfer, so the
+    // panel never shows a cleared frame. Clearing the panel directly made the eyes flicker.
+    constexpr int kBandY = 40;
+    constexpr int kBandH = 160;
+    static M5Canvas band(&M5.Display);
+    band.setPsram(true);
+    band.setColorDepth(16);
+    const bool have_band = band.createSprite(kScreenW, kBandH) != nullptr;
+    if (!have_band) ESP_LOGW("eyes", "no PSRAM for the eye sprite; drawing directly");
+    const uint16_t bg = rgb565(kFaceBackground);
+    const uint16_t color = rgb565(kAccents[static_cast<int>(Accent::Brass)]);
     float t = 0.0f;
-    FaceState previous = FaceState::Idle;
     while (true) {
         const FaceState state = g_runtime.face.load();
         const float lip = static_cast<float>(g_runtime.lip_milli.load()) / 1000.0f;
+        const eyes::Face face = eyes::FaceFor(mood_for(state), t);
+        if (have_band) {
+            band.fillSprite(bg);
+            draw_shape(band, 90, 120 - kBandY, face.left, color, lip);
+            draw_shape(band, 230, 120 - kBandY, face.right, color, lip);
+        }
         // One locked frame. This is the only task that draws, so SPI writes never interleave.
         M5.Display.startWrite();
-        if (state != previous) {
-            M5.Display.fillScreen(rgb565(kFaceBackground));
-            previous = state;
+        if (have_band) {
+            band.pushSprite(0, kBandY);
         } else {
-            // Redraw the eye band only, not the privacy dots in the corner.
-            M5.Display.fillRect(0, 40, kScreenW, 160, rgb565(kFaceBackground));
+            M5.Display.fillRect(0, kBandY, kScreenW, kBandH, bg);
+            draw_shape(M5.Display, 90, 120, face.left, color, lip);
+            draw_shape(M5.Display, 230, 120, face.right, color, lip);
         }
-        const eyes::Face face = eyes::FaceFor(mood_for(state), t);
-        const uint16_t color = rgb565(kAccents[static_cast<int>(Accent::Brass)]);
-        draw_shape(90, 120, face.left, color, lip);
-        draw_shape(230, 120, face.right, color, lip);
         privacy_paint_dots();
         M5.Display.endWrite();
         t += 0.05f;

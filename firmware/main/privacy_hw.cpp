@@ -68,7 +68,11 @@ void privacy_task(void*)
 
 void privacy_paint_dots()
 {
+    // Repaint only when the dots change. Clearing them every frame made them flicker.
+    static int painted = -1;
     const uint8_t bits = g_dot_bits.load();
+    if (painted == bits) return;
+    painted = bits;
     PrivacyDots dots{};
     dots.mic = (bits & 1) != 0;
     dots.camera = (bits & 2) != 0;

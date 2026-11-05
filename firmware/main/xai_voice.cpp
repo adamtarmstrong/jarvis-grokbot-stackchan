@@ -24,6 +24,7 @@
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_websocket_client.h>
 
 namespace jarvis {
@@ -52,6 +53,7 @@ bool g_need_update = false;
 std::string g_rx;
 std::string g_active_reply;
 bool g_spoke = false;
+int g_open_failures = 0;
 
 struct ToolCall {
     bool pending = false;
@@ -98,9 +100,15 @@ void note_audio_delta(const cJSON* root)
 void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
 {
     if (id == WEBSOCKET_EVENT_CONNECTED) {
+        ESP_LOGI(kTag, "realtime connected");
         g_connected.store(true);
         g_need_update = true;
         return;
+    }
+    if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) {
+        const auto* e = static_cast<esp_websocket_event_data_t*>(data);
+        ESP_LOGW(kTag, "realtime %s status=%d", id == WEBSOCKET_EVENT_ERROR ? "error" : "disconnected",
+                 e != nullptr ? e->error_handle.esp_ws_handshake_status_code : -1);
     }
     if (id == WEBSOCKET_EVENT_DISCONNECTED) {
         g_connected.store(false);
@@ -126,6 +134,9 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         return;
     }
     const char* name = type->valuestring;
+    static unsigned deltas = 0;
+    if (std::strstr(name, "delta") == nullptr) ESP_LOGI(kTag, "event %s", name);
+    else if ((deltas++ % 25) == 0) ESP_LOGI(kTag, "%s #%u", name, deltas);
     // Log the event name only. Deltas and transcripts stay off the console.
     if (std::strcmp(name, "response.output_audio.delta") == 0 || std::strcmp(name, "response.audio.delta") == 0) {
         note_audio_delta(root);
@@ -157,7 +168,9 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         if (std::strcmp(name, "response.done") == 0) g_turn_done.store(true);
         ESP_LOGI(kTag, "%s", name);
     } else if (std::strcmp(name, "error") == 0) {
-        ESP_LOGW(kTag, "realtime error event");
+        const cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
+        const cJSON* msg = err != nullptr ? cJSON_GetObjectItemCaseSensitive(err, "message") : nullptr;
+        ESP_LOGW(kTag, "realtime error event: %s", cJSON_IsString(msg) ? msg->valuestring : "(no message)");
     }
     cJSON_Delete(root);
 }
@@ -398,6 +411,12 @@ void play_some()
     // The wake task owns the microphone. Raising speaking makes it call MicGate::close.
     runtime().speaking.store(true);
     runtime().face.store(FaceState::Speaking);
+    static std::int64_t last_log = 0;
+    if (esp_timer_get_time() - last_log > 1000000) {
+        last_log = esp_timer_get_time();
+        ESP_LOGI(kTag, "speaker play %u samples, queued %u, ok=%d", (unsigned)n, (unsigned)g_pcm.size(),
+                 (int)M5.Speaker.isEnabled());
+    }
     M5.Speaker.playRaw(chunk, n, 16000, false);
     lip_feed(chunk, n);
 }
@@ -421,7 +440,23 @@ void voice_task(void*)
             continue;
         }
         if (g_xai == nullptr || !g_connected.load()) {
+            ESP_LOGI(kTag, "opening realtime session");
             if (!open_realtime()) {
+                // The Worker answers 429 while its session, hourly, or daily cap is hit.
+                // Give up after three tries so the face does not stay in Listening forever.
+                if (++g_open_failures >= 3) {
+                    ESP_LOGW(kTag, "voice session unavailable after %d tries; giving up this turn", g_open_failures);
+                    g_open_failures = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(g_mu);
+                        g_speak.clear();
+                    }
+                    g_want.store(false);
+                    runtime().listening.store(false);
+                    runtime().face.store(FaceState::Idle);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    continue;
+                }
                 if (have) {
                     std::lock_guard<std::mutex> lock(g_mu);
                     g_speak.push_front(std::move(next));
@@ -429,6 +464,7 @@ void voice_task(void*)
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 continue;
             }
+            g_open_failures = 0;
             for (int i = 0; i < 50 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (g_need_update && g_connected.load()) send_session_update();
@@ -515,6 +551,8 @@ void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
     if (printed == nullptr) return;
     send_xai(printed);
     cJSON_free(printed);
+    static unsigned appends = 0;
+    if ((appends++ % 50) == 0) ESP_LOGI(kTag, "mic append #%u (%u samples)", appends, (unsigned)n);
 }
 
 } // namespace jarvis
