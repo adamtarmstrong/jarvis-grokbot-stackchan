@@ -24,6 +24,7 @@
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_websocket_client.h>
 #include <lwip/netdb.h>
@@ -118,7 +119,8 @@ void send_xai(const char* json)
 {
     if (g_xai == nullptr || json == nullptr) return;
     if (!esp_websocket_client_is_connected(g_xai)) return;
-    esp_websocket_client_send_text(g_xai, json, static_cast<int>(std::strlen(json)), pdMS_TO_TICKS(1000));
+    const int sent = esp_websocket_client_send_text(g_xai, json, static_cast<int>(std::strlen(json)), pdMS_TO_TICKS(3000));
+    if (sent < 0) ESP_LOGW(kTag, "realtime send failed (%u bytes)", (unsigned)std::strlen(json));
 }
 
 void queue_pcm(const std::uint8_t* data, std::size_t len)
@@ -309,6 +311,9 @@ bool open_realtime()
     ws.buffer_size = 8192;
     ws.crt_bundle_attach = esp_crt_bundle_attach;
     ws.network_timeout_ms = 10000;
+    // The ephemeral secret works once. The library's own reconnect replays it and gets 401,
+    // and each stale client keeps a TLS session, which ran the heap out (mbedtls -0x7F00).
+    ws.disable_auto_reconnect = true;
     g_xai = esp_websocket_client_init(&ws);
     if (g_xai == nullptr) return false;
     esp_websocket_register_events(g_xai, WEBSOCKET_EVENT_ANY, xai_event, nullptr);
@@ -490,6 +495,14 @@ void voice_task(void*)
             continue;
         }
         if (g_xai == nullptr || !g_connected.load()) {
+            if (g_xai != nullptr) {
+                // A dropped client. Free it and mint a fresh secret before reconnecting.
+                esp_websocket_client_stop(g_xai);
+                esp_websocket_client_destroy(g_xai);
+                g_xai = nullptr;
+                g_secret_header.clear();
+                ESP_LOGI(kTag, "freed dropped realtime client; heap %u", (unsigned)esp_get_free_heap_size());
+            }
             ESP_LOGI(kTag, "opening realtime session");
             if (!open_realtime()) {
                 // The Worker answers 429 while its session, hourly, or daily cap is hit.
