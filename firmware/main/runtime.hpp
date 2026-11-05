@@ -39,6 +39,8 @@ Runtime& runtime();
 
 void eye_start();
 void privacy_start();
+// Draws the privacy dots. Call only from the eye task, which owns M5.Display.
+void privacy_paint_dots();
 void head_start();
 void head_submit(float yaw_deg, float pitch_deg);
 

@@ -48,6 +48,8 @@ void eye_task(void*)
     while (true) {
         const FaceState state = g_runtime.face.load();
         const float lip = static_cast<float>(g_runtime.lip_milli.load()) / 1000.0f;
+        // One locked frame. This is the only task that draws, so SPI writes never interleave.
+        M5.Display.startWrite();
         if (state != previous) {
             M5.Display.fillScreen(rgb565(kFaceBackground));
             previous = state;
@@ -59,6 +61,8 @@ void eye_task(void*)
         const uint16_t color = rgb565(kAccents[static_cast<int>(Accent::Brass)]);
         draw_shape(90, 120, face.left, color, lip);
         draw_shape(230, 120, face.right, color, lip);
+        privacy_paint_dots();
+        M5.Display.endWrite();
         t += 0.05f;
         vTaskDelay(pdMS_TO_TICKS(33));
     }
@@ -89,7 +93,9 @@ void eye_start()
         }
     }
     M5.Display.setRotation(1);
+    M5.Display.setBrightness(160);
     M5.Display.fillScreen(rgb565(kFaceBackground));
+
     // UNTESTED on a panel. Priority 1 is deliberate; audio tasks use 5.
     xTaskCreatePinnedToCore(eye_task, "eyes", 4096, nullptr, 1, nullptr, 1);
 }

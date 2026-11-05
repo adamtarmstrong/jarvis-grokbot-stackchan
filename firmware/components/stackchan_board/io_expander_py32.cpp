@@ -23,6 +23,9 @@ constexpr std::uint8_t kRegGpioPullDownHigh = 0x0C;
 // just writes a count + RGB565 LE RAM and toggles the refresh bit.
 constexpr std::uint8_t kRegLedCfg = 0x24;          // [5:0]=count, [6]=refresh
 constexpr std::uint8_t kRegLedRamStart = 0x30;     // 32 LEDs × 2 B each
+// I2C config. 0x00 turns off the idle sleep that NACKs the first write after a quiet
+// period, at 100 kHz. M5Unified's M5IOE1_Class::begin() writes the same value.
+constexpr std::uint8_t kRegI2cCfg = 0x23;
 constexpr std::uint8_t kLedCfgRefreshBit = 1u << 6;
 constexpr std::uint8_t kLedCfgCountMask = 0x3F;
 
@@ -33,6 +36,9 @@ tl::expected<Py32Expander, Error> Py32Expander::probe(std::uint8_t address)
     const std::uint8_t version = m5::In_I2C.readRegister8(address, kRegVersion, kI2cFreq);
     if (version == 0x00 || version == 0xFF) {
         return tl::unexpected{Error::ExpanderProbe};
+    }
+    if (!m5::In_I2C.writeRegister8(address, kRegI2cCfg, 0x00, kI2cFreq)) {
+        ESP_LOGW("py32", "could not turn off I2C idle sleep");
     }
     return Py32Expander{address};
 }
