@@ -502,6 +502,9 @@ void voice_task(void*)
                 g_xai = nullptr;
                 g_secret_header.clear();
                 ESP_LOGI(kTag, "freed dropped realtime client; heap %u", (unsigned)esp_get_free_heap_size());
+                // The Worker keeps the old session live and would answer /token with 429.
+                worker_send_text("{\"type\":\"session_end\"}");
+                vTaskDelay(pdMS_TO_TICKS(1500));
             }
             ESP_LOGI(kTag, "opening realtime session");
             if (!open_realtime()) {

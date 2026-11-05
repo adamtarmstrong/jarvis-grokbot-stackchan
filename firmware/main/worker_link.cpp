@@ -333,6 +333,9 @@ bool config_is_ready()
     if (cfg.path_prefix.size() < 8 || cfg.path_prefix.find('/') != std::string::npos) return false;
     g_cfg = cfg;
     g_cfg_ready = true;
+    // A reset can leave the Worker's session record live for its 10-minute TTL, which
+    // answers /token with 429. This device owns that record, so end it once the link is up.
+    worker_send_text("{\"type\":\"session_end\"}");
     return true;
 }
 
