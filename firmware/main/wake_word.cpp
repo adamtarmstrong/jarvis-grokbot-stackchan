@@ -59,6 +59,9 @@ void feed_task(void*)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        // record() returns before the DMA fills buf. Wait for it, or AFE and xAI get a stale,
+        // half-written chunk.
+        while (M5.Mic.isRecording()) vTaskDelay(1);
         g_afe->feed(g_afe_data, buf);
         if (runtime().ptt.load() || runtime().listening.load()) voice_feed_pcm(buf, static_cast<std::size_t>(chunk));
     }
@@ -78,7 +81,6 @@ void detect_task(void*)
         if (now - last_ms < 1500) continue;
         last_ms = now;
         ESP_LOGI(kTag, "wake word");
-        runtime().face.store(FaceState::Listening);
         voice_start_turn();
     }
 }

@@ -7,7 +7,7 @@
 
 namespace jarvis {
 
-enum class FaceState : std::uint8_t { Idle, Listening, Thinking, Speaking, Sleeping };
+enum class FaceState : std::uint8_t { Idle, Listening, Thinking, Speaking, Sleeping, Connecting };
 
 inline eyes::Mood mood_for(FaceState state)
 {
@@ -18,6 +18,8 @@ inline eyes::Mood mood_for(FaceState state)
         return eyes::Mood::Thinking;
     case FaceState::Speaking:
         return eyes::Mood::Speaking;
+    case FaceState::Connecting:
+        return eyes::Mood::Curious;  // waiting for the realtime session; do not speak yet
     case FaceState::Sleeping:
         return eyes::Mood::Sleepy;
     case FaceState::Idle:

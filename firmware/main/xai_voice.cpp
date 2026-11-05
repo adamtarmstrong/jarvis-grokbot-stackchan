@@ -26,6 +26,9 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_websocket_client.h>
+#include <lwip/netdb.h>
+
+#include <cmath>
 
 namespace jarvis {
 
@@ -50,10 +53,54 @@ std::string g_realtime_url;
 std::string g_voice = "leo";
 std::int64_t g_expires_at = 0;
 bool g_need_update = false;
+std::atomic<bool> g_awaiting_update{false};
 std::string g_rx;
 std::string g_active_reply;
 bool g_spoke = false;
 int g_open_failures = 0;
+std::atomic<bool> g_ready_beep{false};
+std::atomic<std::int64_t> g_listen_deadline_us{0};
+constexpr std::int64_t kListenWindowUs = 8'000'000;
+
+// Speaker and microphone share one I2S controller. Raise speaking so the wake task closes
+// the mic, then start the speaker. Returns false if the speaker would not start.
+bool speaker_ready()
+{
+    runtime().speaking.store(true);
+    for (int i = 0; i < 30 && M5.Mic.isEnabled(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+    if (M5.Speaker.isEnabled()) return true;
+    if (!M5.Speaker.begin()) {
+        ESP_LOGW(kTag, "speaker did not start");
+        return false;
+    }
+    M5.Speaker.setVolume(180);
+    ESP_LOGI(kTag, "speaker started");
+    return true;
+}
+
+// Resolve the Worker host before minting. Wi-Fi can be up while DNS still fails.
+bool wait_for_dns(const std::string& base)
+{
+    std::string host = base;
+    if (host.rfind("https://", 0) == 0) host.erase(0, 8);
+    const auto cut = host.find_first_of("/:");
+    if (cut != std::string::npos) host.resize(cut);
+    if (host.empty()) return false;
+    for (int attempt = 1; attempt <= 6; ++attempt) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        addrinfo* res = nullptr;
+        const int rc = getaddrinfo(host.c_str(), "443", &hints, &res);
+        if (res != nullptr) freeaddrinfo(res);
+        if (rc == 0) {
+            if (attempt > 1) ESP_LOGI(kTag, "worker DNS ok on try %d", attempt);
+            return true;
+        }
+        ESP_LOGW(kTag, "worker DNS try %d failed (%d)", attempt, rc);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+    return false;
+}
 
 struct ToolCall {
     bool pending = false;
@@ -112,6 +159,8 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
     }
     if (id == WEBSOCKET_EVENT_DISCONNECTED) {
         g_connected.store(false);
+        g_awaiting_update.store(false);
+        g_listen_deadline_us.store(0);
         return;
     }
     if (id != WEBSOCKET_EVENT_DATA || data == nullptr) return;
@@ -141,13 +190,12 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
     if (std::strcmp(name, "response.output_audio.delta") == 0 || std::strcmp(name, "response.audio.delta") == 0) {
         note_audio_delta(root);
     } else if (std::strcmp(name, "session.created") == 0 || std::strcmp(name, "conversation.created") == 0) {
-        g_need_update = true;
         ESP_LOGI(kTag, "%s", name);
     } else if (std::strcmp(name, "session.updated") == 0) {
-        g_need_update = false;
-        runtime().face.store(FaceState::Listening);
         ESP_LOGI(kTag, "session.updated");
+        if (g_awaiting_update.exchange(false)) g_ready_beep.store(true);
     } else if (std::strcmp(name, "input_audio_buffer.speech_started") == 0) {
+        g_listen_deadline_us.store(0);
         runtime().face.store(FaceState::Listening);
     } else if (std::strcmp(name, "input_audio_buffer.speech_stopped") == 0) {
         runtime().face.store(FaceState::Thinking);
@@ -183,6 +231,7 @@ bool mint_secret()
         return false;
     }
     std::string body;
+    if (!wait_for_dns(cfg.worker_base)) return false;
     if (!worker_post(cfg, "/token", "{}", body)) return false;
     cJSON* root = cJSON_Parse(body.c_str());
     if (root == nullptr) return false;
@@ -409,7 +458,7 @@ void play_some()
         return;
     }
     // The wake task owns the microphone. Raising speaking makes it call MicGate::close.
-    runtime().speaking.store(true);
+    if (!speaker_ready()) return;
     runtime().face.store(FaceState::Speaking);
     static std::int64_t last_log = 0;
     if (esp_timer_get_time() - last_log > 1000000) {
@@ -467,12 +516,38 @@ void voice_task(void*)
             g_open_failures = 0;
             for (int i = 0; i < 50 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (g_need_update && g_connected.load()) send_session_update();
+        if (g_need_update && g_connected.load()) {
+            // Send once per connection. Re-sending every loop produced several session.updated.
+            g_need_update = false;
+            g_awaiting_update.store(true);
+            send_session_update();
+        }
         answer_tool();
-        if (have && g_connected.load() && !g_need_update) inject_text(next);
+        if (have && g_connected.load() && !g_need_update && !g_awaiting_update.load()) inject_text(next);
         else if (have) {
             std::lock_guard<std::mutex> lock(g_mu);
             g_speak.push_front(std::move(next));
+        }
+        if (g_ready_beep.exchange(false)) {
+            // Ready to hear: chime, then hand the I2S back to the mic and open the listen window.
+            if (speaker_ready()) {
+                M5.Speaker.tone(1320, 120);
+                vTaskDelay(pdMS_TO_TICKS(140));
+                M5.Speaker.tone(1760, 120);
+                for (int i = 0; i < 40 && M5.Speaker.isPlaying(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            runtime().speaking.store(false);
+            runtime().face.store(FaceState::Listening);
+            if (runtime().listening.load()) g_listen_deadline_us.store(esp_timer_get_time() + kListenWindowUs);
+            ESP_LOGI(kTag, "ready chime played; listening for 8 s");
+        }
+        {
+            const std::int64_t deadline = g_listen_deadline_us.load();
+            if (deadline != 0 && esp_timer_get_time() > deadline && !runtime().ptt.load()) {
+                g_listen_deadline_us.store(0);
+                ESP_LOGI(kTag, "no speech within 8 s of the chime; ending the turn");
+                voice_stop_turn();
+            }
         }
         play_some();
         if (g_turn_done.load() && !pcm_pending() && !M5.Speaker.isPlaying()) {
@@ -525,7 +600,7 @@ void voice_start_turn()
 {
     if (g_want.load()) g_interrupt.store(true);
     runtime().listening.store(true);
-    runtime().face.store(FaceState::Listening);
+    runtime().face.store(g_connected.load() ? FaceState::Listening : FaceState::Connecting);
     g_want.store(true);
     ensure_voice_task();
 }
@@ -552,7 +627,22 @@ void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
     send_xai(printed);
     cJSON_free(printed);
     static unsigned appends = 0;
-    if ((appends++ % 50) == 0) ESP_LOGI(kTag, "mic append #%u (%u samples)", appends, (unsigned)n);
+    static int peak = 0;
+    static double sum_sq = 0;
+    static std::size_t count = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+        if (v > peak) peak = v;
+        sum_sq += static_cast<double>(pcm[i]) * pcm[i];
+    }
+    count += n;
+    if ((appends++ % 50) == 0) {
+        ESP_LOGI(kTag, "mic append #%u (%u samples, pcm16 16 kHz mono LE b64) rms %d peak %d", appends, (unsigned)n,
+                 static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak);
+        peak = 0;
+        sum_sq = 0;
+        count = 0;
+    }
 }
 
 } // namespace jarvis
