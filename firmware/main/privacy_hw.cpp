@@ -35,9 +35,16 @@ CameraGate& camera_slot()
 void paint_dots(const PrivacyDots& dots)
 {
     const uint16_t bg = M5.Display.color565(kFaceBackground.r, kFaceBackground.g, kFaceBackground.b);
-    M5.Display.fillRect(300, 4, 16, 16, bg);
-    if (dots.mic) M5.Display.fillCircle(304, 8, 3, M5.Display.color565(kMicDot.r, kMicDot.g, kMicDot.b));
-    if (dots.camera) M5.Display.fillCircle(312, 8, 3, M5.Display.color565(kCameraDot.r, kCameraDot.g, kCameraDot.b));
+    M5.Display.fillRect(299, 3, 20, 11, bg);
+    const uint16_t ring = M5.Display.color565(kDotRing.r, kDotRing.g, kDotRing.b);
+    if (dots.mic) {
+        M5.Display.fillCircle(304, 8, 4, ring);
+        M5.Display.fillCircle(304, 8, 3, M5.Display.color565(kMicDotScreen.r, kMicDotScreen.g, kMicDotScreen.b));
+    }
+    if (dots.camera) {
+        M5.Display.fillCircle(313, 8, 4, ring);
+        M5.Display.fillCircle(313, 8, 3, M5.Display.color565(kCameraDot.r, kCameraDot.g, kCameraDot.b));
+    }
 }
 
 void mirror_leds(stackchan::board::Py32Expander* expander, const PrivacyDots& dots)

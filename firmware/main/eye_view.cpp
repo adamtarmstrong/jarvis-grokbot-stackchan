@@ -32,7 +32,9 @@ void draw_shape(lgfx::LovyanGFX& gfx, int cx, int cy, const eyes::Shape& shape, 
                                  static_cast<int>(h * 0.25f), 4, color);
         return;
     }
-    gfx.fillEllipse(x, y, static_cast<int>(shape.w / 2), static_cast<int>(h / 2), color);
+    // Square eyes to match avatarShape=square. Moods still change w, h, offsets and lids.
+    gfx.fillRoundRect(x - static_cast<int>(shape.w / 2), y - static_cast<int>(h / 2), static_cast<int>(shape.w),
+                      static_cast<int>(h), 6, color);
     if (shape.lid > 0.0f) {
         const int lid_h = static_cast<int>(h * shape.lid);
         gfx.fillRect(x - static_cast<int>(shape.w / 2) - 2, y - static_cast<int>(h / 2) - 2,
@@ -54,7 +56,7 @@ void eye_task(void*)
     const bool have_band = band.createSprite(kScreenW, kBandH) != nullptr;
     if (!have_band) ESP_LOGW("eyes", "no PSRAM for the eye sprite; drawing directly");
     const uint16_t bg = rgb565(kFaceBackground);
-    const uint16_t color = rgb565(kAccents[static_cast<int>(Accent::Brass)]);
+    const uint16_t color = rgb565(kEyeColor);
     float t = 0.0f;
     while (true) {
         const FaceState state = g_runtime.face.load();
