@@ -28,6 +28,9 @@ inline eyes::Mood mood_for(FaceState state)
     return eyes::Mood::Idle;
 }
 
+// Hard cap on an xAI realtime session. The voice task closes at this mark.
+constexpr std::int64_t kMaxSessionUs = 60'000'000;
+
 // Face and privacy tasks read these. Audio code writes them.
 struct Runtime {
     std::atomic<FaceState> face{FaceState::Idle};
@@ -35,6 +38,8 @@ struct Runtime {
     std::atomic<bool> listening{false};
     std::atomic<bool> speaking{false};
     std::atomic<bool> ptt{false};
+    // 0 = no open session; otherwise esp_timer deadline for the 60 s cap.
+    std::atomic<std::int64_t> session_deadline_us{0};
 };
 
 Runtime& runtime();

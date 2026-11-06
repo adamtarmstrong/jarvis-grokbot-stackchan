@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "jarvis/privacy.hpp"
 
@@ -76,6 +77,21 @@ void eye_task(void*)
             draw_shape(M5.Display, 230, 120, face.right, color, lip);
         }
         privacy_paint_dots();
+        {
+            constexpr int kBarH = 2;
+            const std::int64_t deadline = g_runtime.session_deadline_us.load();
+            M5.Display.fillRect(0, 0, kScreenW, kBarH, bg);
+            if (deadline > 0) {
+                const std::int64_t remain = deadline - esp_timer_get_time();
+                float used = 1.0f - static_cast<float>(remain) / static_cast<float>(kMaxSessionUs);
+                if (used < 0.0f) used = 0.0f;
+                if (used > 1.0f) used = 1.0f;
+                int w = static_cast<int>(used * static_cast<float>(kScreenW) + 0.5f);
+                if (used > 0.0f && w < 1) w = 1;
+                const uint16_t bar = used >= 0.75f ? rgb565(Rgb{255, 196, 72}) : rgb565(Rgb{255, 255, 255});
+                if (w > 0) M5.Display.fillRect(0, 0, w, kBarH, bar);
+            }
+        }
         M5.Display.endWrite();
         t += 0.05f;
         vTaskDelay(pdMS_TO_TICKS(33));

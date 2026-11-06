@@ -153,6 +153,7 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         ESP_LOGI(kTag, "realtime connected");
         g_connected.store(true);
         g_need_update = true;
+        runtime().session_deadline_us.store(esp_timer_get_time() + kMaxSessionUs);
         return;
     }
     if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) {
@@ -164,6 +165,7 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         g_connected.store(false);
         g_awaiting_update.store(false);
         g_listen_deadline_us.store(0);
+        runtime().session_deadline_us.store(0);
         return;
     }
     if (id != WEBSOCKET_EVENT_DATA || data == nullptr) return;
@@ -329,6 +331,7 @@ bool open_realtime()
 void close_realtime()
 {
     g_connected.store(false);
+    runtime().session_deadline_us.store(0);
     if (g_xai != nullptr) {
         esp_websocket_client_stop(g_xai);
         esp_websocket_client_destroy(g_xai);
@@ -565,6 +568,17 @@ void voice_task(void*)
                 g_listen_deadline_us.store(0);
                 ESP_LOGI(kTag, "no speech within 8 s of the chime; ending the turn");
                 voice_stop_turn();
+            }
+        }
+        {
+            const std::int64_t session_deadline = runtime().session_deadline_us.load();
+            if (session_deadline != 0 && esp_timer_get_time() > session_deadline && g_connected.load()) {
+                ESP_LOGW(kTag, "session hit 60 s cap; ending");
+                runtime().session_deadline_us.store(0);
+                g_listen_deadline_us.store(0);
+                runtime().listening.store(false);
+                g_want.store(false);
+                close_realtime();
             }
         }
         play_some();
