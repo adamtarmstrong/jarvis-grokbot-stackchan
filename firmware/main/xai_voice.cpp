@@ -121,6 +121,9 @@ std::size_t mic_ring_pop(std::int16_t* dest, std::size_t max)
 bool speaker_ready()
 {
     runtime().speaking.store(true);
+    // If the speaker already owns I2S, do not wait on the mic — that wait was
+    // happening before this check and stretched speech to about 20 ms per second.
+    if (M5.Speaker.isEnabled()) return true;
     int waited = 0;
     for (; waited < 100 && M5.Mic.isEnabled(); ++waited) vTaskDelay(pdMS_TO_TICKS(10));
     if (M5.Speaker.isEnabled()) return true;
@@ -553,11 +556,12 @@ bool tool_pending()
 
 void play_some()
 {
-    std::int16_t chunk[320];
+    constexpr std::size_t kPlayChunk = 3200; // 200 ms at 16 kHz
+    static std::int16_t chunk[kPlayChunk]; // not on the 8 KB voice task stack
     std::size_t n = 0;
     {
         std::lock_guard<std::mutex> lock(g_pcm_mu);
-        n = g_pcm.size() < 320 ? g_pcm.size() : 320;
+        n = g_pcm.size() < kPlayChunk ? g_pcm.size() : kPlayChunk;
         for (std::size_t i = 0; i < n; ++i) {
             chunk[i] = g_pcm.front();
             g_pcm.pop_front();
