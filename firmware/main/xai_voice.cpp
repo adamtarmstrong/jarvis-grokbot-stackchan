@@ -60,8 +60,12 @@ std::string g_active_reply;
 bool g_spoke = false;
 int g_open_failures = 0;
 std::atomic<bool> g_ready_beep{false};
+std::atomic<bool> g_ack_beep{false};
 std::atomic<std::int64_t> g_listen_deadline_us{0};
 constexpr std::int64_t kListenWindowUs = 8'000'000;
+std::mutex g_mic_send_mu;
+std::deque<std::int16_t> g_mic_send;
+constexpr std::size_t kMicSendCap = 80'000; // 5 s at 16 kHz, so a question asked while connecting is not lost
 
 // Speaker and microphone share one I2S controller. Raise speaking so the wake task closes
 // the mic, then start the speaker. Returns false if the speaker would not start.
@@ -114,6 +118,58 @@ ToolCall g_tool;
 
 std::mutex g_pcm_mu;
 std::deque<std::int16_t> g_pcm;
+
+void send_xai(const char* json);
+
+void flush_mic_to_xai()
+{
+    if (g_xai == nullptr || !g_connected.load()) return;
+    if (runtime().speaking.load()) return;
+    if (!runtime().ptt.load() && !runtime().listening.load()) return;
+    // Wait until session.updated so format and server VAD apply to this audio.
+    if (g_need_update || g_awaiting_update.load()) return;
+
+    constexpr std::size_t kChunk = 1600;
+    std::int16_t chunk[kChunk];
+    std::size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mic_send_mu);
+        n = g_mic_send.size() < kChunk ? g_mic_send.size() : kChunk;
+        for (std::size_t i = 0; i < n; ++i) {
+            chunk[i] = g_mic_send.front();
+            g_mic_send.pop_front();
+        }
+    }
+    if (n == 0) return;
+
+    const auto encoded = b64_encode(reinterpret_cast<const std::uint8_t*>(chunk), n * sizeof(std::int16_t));
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
+    cJSON_AddStringToObject(root, "audio", encoded.c_str());
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) return;
+    send_xai(printed);
+    cJSON_free(printed);
+
+    static unsigned appends = 0;
+    static int peak = 0;
+    static double sum_sq = 0;
+    static std::size_t count = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const int v = chunk[i] < 0 ? -chunk[i] : chunk[i];
+        if (v > peak) peak = v;
+        sum_sq += static_cast<double>(chunk[i]) * chunk[i];
+    }
+    count += n;
+    if ((appends++ % 50) == 0) {
+        ESP_LOGI(kTag, "mic append #%u (%u samples, pcm16 16 kHz mono LE b64) rms %d peak %d", appends, (unsigned)n,
+                 static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak);
+        peak = 0;
+        sum_sq = 0;
+        count = 0;
+    }
+}
 
 void send_xai(const char* json)
 {
@@ -310,7 +366,7 @@ bool open_realtime()
     esp_websocket_client_config_t ws = {};
     ws.uri = g_realtime_url.c_str();
     ws.headers = g_secret_header.c_str();
-    ws.buffer_size = 8192;
+    ws.buffer_size = 16384;
     ws.crt_bundle_attach = esp_crt_bundle_attach;
     ws.network_timeout_ms = 10000;
     // The ephemeral secret works once. The library's own reconnect replays it and gets 401,
@@ -497,17 +553,37 @@ void voice_task(void*)
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        if (g_ack_beep.exchange(false)) {
+            // Immediate "I heard you" tone so the wait for /token is not silent.
+            if (speaker_ready()) {
+                const bool toned = M5.Speaker.tone(1046, 110);
+                ESP_LOGI(kTag, "heard-you chime tone=%d", (int)toned);
+                for (int i = 0; i < 20 && M5.Speaker.isPlaying(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            runtime().speaking.store(false);
+        }
         if (g_xai == nullptr || !g_connected.load()) {
             if (g_xai != nullptr) {
-                // A dropped client. Free it and mint a fresh secret before reconnecting.
+                // A dropped client. End this turn. Minting again spends another reservation
+                // and plays another ready chime, which sounded like a second wake.
                 esp_websocket_client_stop(g_xai);
                 esp_websocket_client_destroy(g_xai);
                 g_xai = nullptr;
                 g_secret_header.clear();
-                ESP_LOGI(kTag, "freed dropped realtime client; heap %u", (unsigned)esp_get_free_heap_size());
-                // The Worker keeps the old session live and would answer /token with 429.
+                ESP_LOGW(kTag, "realtime dropped; ending turn instead of opening another session; heap %u",
+                         (unsigned)esp_get_free_heap_size());
                 worker_send_text("{\"type\":\"session_end\"}");
-                vTaskDelay(pdMS_TO_TICKS(1500));
+                g_listen_deadline_us.store(0);
+                runtime().session_deadline_us.store(0);
+                runtime().listening.store(false);
+                runtime().speaking.store(false);
+                if (!runtime().ptt.load()) g_want.store(false);
+                runtime().face.store(FaceState::Idle);
+                {
+                    std::lock_guard<std::mutex> lock(g_mic_send_mu);
+                    g_mic_send.clear();
+                }
+                continue;
             }
             ESP_LOGI(kTag, "opening realtime session");
             if (!open_realtime()) {
@@ -581,6 +657,7 @@ void voice_task(void*)
                 close_realtime();
             }
         }
+        flush_mic_to_xai();
         play_some();
         if (g_turn_done.load() && !pcm_pending() && !M5.Speaker.isPlaying()) {
             g_turn_done.store(false);
@@ -633,6 +710,11 @@ void voice_start_turn()
     if (g_want.load()) g_interrupt.store(true);
     runtime().listening.store(true);
     runtime().face.store(g_connected.load() ? FaceState::Listening : FaceState::Connecting);
+    g_ack_beep.store(true);
+    {
+        std::lock_guard<std::mutex> lock(g_mic_send_mu);
+        g_mic_send.clear();
+    }
     g_want.store(true);
     ensure_voice_task();
 }
@@ -645,35 +727,13 @@ void voice_stop_turn()
 
 void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
 {
-    if (pcm == nullptr || n == 0 || g_xai == nullptr || !g_connected.load()) return;
+    if (pcm == nullptr || n == 0) return;
     if (runtime().speaking.load()) return;
     if (!runtime().ptt.load() && !runtime().listening.load()) return;
-    if (n > 1600) n = 1600;
-    const auto encoded = b64_encode(reinterpret_cast<const std::uint8_t*>(pcm), n * sizeof(std::int16_t));
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
-    cJSON_AddStringToObject(root, "audio", encoded.c_str());
-    char* printed = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (printed == nullptr) return;
-    send_xai(printed);
-    cJSON_free(printed);
-    static unsigned appends = 0;
-    static int peak = 0;
-    static double sum_sq = 0;
-    static std::size_t count = 0;
+    std::lock_guard<std::mutex> lock(g_mic_send_mu);
     for (std::size_t i = 0; i < n; ++i) {
-        const int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
-        if (v > peak) peak = v;
-        sum_sq += static_cast<double>(pcm[i]) * pcm[i];
-    }
-    count += n;
-    if ((appends++ % 50) == 0) {
-        ESP_LOGI(kTag, "mic append #%u (%u samples, pcm16 16 kHz mono LE b64) rms %d peak %d", appends, (unsigned)n,
-                 static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak);
-        peak = 0;
-        sum_sq = 0;
-        count = 0;
+        if (g_mic_send.size() >= kMicSendCap) g_mic_send.pop_front();
+        g_mic_send.push_back(pcm[i]);
     }
 }
 
