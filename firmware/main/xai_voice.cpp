@@ -23,6 +23,7 @@
 #include <M5Unified.h>
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -64,8 +65,56 @@ std::atomic<bool> g_ack_beep{false};
 std::atomic<std::int64_t> g_listen_deadline_us{0};
 constexpr std::int64_t kListenWindowUs = 8'000'000;
 std::mutex g_mic_send_mu;
-std::deque<std::int16_t> g_mic_send;
-constexpr std::size_t kMicSendCap = 80'000; // 5 s at 16 kHz, so a question asked while connecting is not lost
+constexpr std::size_t kMicSendCap = 80'000; // 5 s at 16 kHz, kept in PSRAM so TLS can use internal RAM
+std::int16_t* g_mic_ring = nullptr;
+std::size_t g_mic_r = 0;
+std::size_t g_mic_w = 0;
+std::size_t g_mic_n = 0;
+
+bool mic_ring_ensure()
+{
+    if (g_mic_ring != nullptr) return true;
+    g_mic_ring = static_cast<std::int16_t*>(
+        heap_caps_malloc(kMicSendCap * sizeof(std::int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_mic_ring == nullptr) {
+        ESP_LOGE(kTag, "mic ring PSRAM alloc failed");
+        return false;
+    }
+    g_mic_r = g_mic_w = g_mic_n = 0;
+    ESP_LOGI(kTag, "mic ring ready in PSRAM (%u samples)", (unsigned)kMicSendCap);
+    return true;
+}
+
+void mic_ring_clear()
+{
+    g_mic_r = g_mic_w = g_mic_n = 0;
+}
+
+void mic_ring_push(std::int16_t sample)
+{
+    if (!mic_ring_ensure()) return;
+    if (g_mic_n == kMicSendCap) {
+        g_mic_r += 1;
+        if (g_mic_r == kMicSendCap) g_mic_r = 0;
+        g_mic_n -= 1;
+    }
+    g_mic_ring[g_mic_w] = sample;
+    g_mic_w += 1;
+    if (g_mic_w == kMicSendCap) g_mic_w = 0;
+    g_mic_n += 1;
+}
+
+std::size_t mic_ring_pop(std::int16_t* dest, std::size_t max)
+{
+    const std::size_t n = g_mic_n < max ? g_mic_n : max;
+    for (std::size_t i = 0; i < n; ++i) {
+        dest[i] = g_mic_ring[g_mic_r];
+        g_mic_r += 1;
+        if (g_mic_r == kMicSendCap) g_mic_r = 0;
+    }
+    g_mic_n -= n;
+    return n;
+}
 
 // Speaker and microphone share one I2S controller. Raise speaking so the wake task closes
 // the mic, then start the speaker. Returns false if the speaker would not start.
@@ -134,11 +183,7 @@ void flush_mic_to_xai()
     std::size_t n = 0;
     {
         std::lock_guard<std::mutex> lock(g_mic_send_mu);
-        n = g_mic_send.size() < kChunk ? g_mic_send.size() : kChunk;
-        for (std::size_t i = 0; i < n; ++i) {
-            chunk[i] = g_mic_send.front();
-            g_mic_send.pop_front();
-        }
+        n = mic_ring_pop(chunk, kChunk);
     }
     if (n == 0) return;
 
@@ -581,7 +626,7 @@ void voice_task(void*)
                 runtime().face.store(FaceState::Idle);
                 {
                     std::lock_guard<std::mutex> lock(g_mic_send_mu);
-                    g_mic_send.clear();
+                    mic_ring_clear();
                 }
                 continue;
             }
@@ -713,7 +758,7 @@ void voice_start_turn()
     g_ack_beep.store(true);
     {
         std::lock_guard<std::mutex> lock(g_mic_send_mu);
-        g_mic_send.clear();
+        mic_ring_clear();
     }
     g_want.store(true);
     ensure_voice_task();
@@ -731,10 +776,7 @@ void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
     if (runtime().speaking.load()) return;
     if (!runtime().ptt.load() && !runtime().listening.load()) return;
     std::lock_guard<std::mutex> lock(g_mic_send_mu);
-    for (std::size_t i = 0; i < n; ++i) {
-        if (g_mic_send.size() >= kMicSendCap) g_mic_send.pop_front();
-        g_mic_send.push_back(pcm[i]);
-    }
+    for (std::size_t i = 0; i < n; ++i) mic_ring_push(pcm[i]);
 }
 
 } // namespace jarvis
