@@ -216,15 +216,21 @@ void ws_event(void*, esp_event_base_t, std::int32_t id, void* data)
 
 void drain_outbox()
 {
-    std::deque<std::string> local;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        local.swap(g_outbox);
-    }
-    if (g_client == nullptr) return;
-    for (const std::string& msg : local) {
-        if (!esp_websocket_client_is_connected(g_client)) break;
-        esp_websocket_client_send_text(g_client, msg.c_str(), static_cast<int>(msg.size()), pdMS_TO_TICKS(1000));
+    while (g_client != nullptr && esp_websocket_client_is_connected(g_client)) {
+        // Keep the head queued on disconnect or failed transmission. In particular,
+        // losing session_end keeps the full ten-minute daily reservation charged.
+        std::string msg;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (g_outbox.empty()) return;
+            msg = g_outbox.front();
+        }
+        const int sent = esp_websocket_client_send_text(g_client, msg.c_str(), static_cast<int>(msg.size()), pdMS_TO_TICKS(1000));
+        if (sent != static_cast<int>(msg.size())) return;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            if (!g_outbox.empty() && g_outbox.front() == msg) g_outbox.pop_front();
+        }
     }
 }
 

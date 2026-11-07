@@ -9,6 +9,7 @@
 #include "link.hpp"
 #include "runtime.hpp"
 #include "b64.hpp"
+#include "pcm_ring.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -54,11 +55,11 @@ std::string g_secret_header;
 std::string g_realtime_url;
 std::string g_voice = "leo";
 std::int64_t g_expires_at = 0;
-bool g_need_update = false;
+std::atomic<bool> g_need_update{false};
 std::atomic<bool> g_awaiting_update{false};
 std::string g_rx;
 std::string g_active_reply;
-bool g_spoke = false;
+std::atomic<bool> g_spoke{false};
 int g_open_failures = 0;
 std::atomic<bool> g_ready_beep{false};
 std::atomic<bool> g_ack_beep{false};
@@ -169,7 +170,27 @@ struct ToolCall {
 ToolCall g_tool;
 
 std::mutex g_pcm_mu;
-std::deque<std::int16_t> g_pcm;
+PcmRing g_pcm;
+constexpr std::size_t kPcmCap = 16000 * 60;
+constexpr std::size_t kPlayChunk = 3200;
+constexpr std::size_t kPlayBuffers = 3;
+std::int16_t* g_audio_storage = nullptr;
+std::size_t g_play_index = 0;
+std::atomic<bool> g_audio_failed{false};
+
+bool audio_storage_ensure()
+{
+    std::lock_guard<std::mutex> lock(g_pcm_mu);
+    if (g_audio_storage != nullptr) return true;
+    g_audio_storage = static_cast<std::int16_t*>(heap_caps_malloc(
+        (kPcmCap + kPlayBuffers * kPlayChunk) * sizeof(std::int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_audio_storage == nullptr) {
+        ESP_LOGE(kTag, "playback PSRAM alloc failed");
+        return false;
+    }
+    g_pcm.bind(g_audio_storage, kPcmCap);
+    return true;
+}
 
 void send_xai(const char* json);
 
@@ -233,10 +254,12 @@ void queue_pcm(const std::uint8_t* data, std::size_t len)
     std::lock_guard<std::mutex> lock(g_pcm_mu);
     const std::size_t samples = len / 2;
     for (std::size_t i = 0; i < samples; ++i) {
-        if (g_pcm.size() >= 16000) g_pcm.pop_front();
         const auto lo = data[i * 2];
         const auto hi = data[i * 2 + 1];
-        g_pcm.push_back(static_cast<std::int16_t>(lo | (hi << 8)));
+        if (!g_pcm.push(static_cast<std::int16_t>(lo | (hi << 8)))) {
+            if (!g_audio_failed.exchange(true)) ESP_LOGE(kTag, "playback buffer full; aborting turn");
+            break;
+        }
     }
 }
 
@@ -309,6 +332,7 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
     } else if (std::strcmp(name, "input_audio_buffer.speech_stopped") == 0) {
         runtime().face.store(FaceState::Thinking);
     } else if (std::strcmp(name, "response.created") == 0) {
+        g_turn_done.store(false);
         runtime().face.store(FaceState::Thinking);
     } else if (std::strcmp(name, "response.function_call_arguments.done") == 0) {
         const cJSON* call_id = cJSON_GetObjectItemCaseSensitive(root, "call_id");
@@ -325,9 +349,7 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         if (std::strcmp(name, "response.done") == 0) g_turn_done.store(true);
         ESP_LOGI(kTag, "%s", name);
     } else if (std::strcmp(name, "error") == 0) {
-        const cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
-        const cJSON* msg = err != nullptr ? cJSON_GetObjectItemCaseSensitive(err, "message") : nullptr;
-        ESP_LOGW(kTag, "realtime error event: %s", cJSON_IsString(msg) ? msg->valuestring : "(no message)");
+        ESP_LOGW(kTag, "realtime error event");
     }
     cJSON_Delete(root);
 }
@@ -410,6 +432,7 @@ void send_session_update()
 
 bool open_realtime()
 {
+    if (!audio_storage_ensure()) return false;
     if (g_secret_header.empty() && !mint_secret()) return false;
     esp_websocket_client_config_t ws = {};
     ws.uri = g_realtime_url.c_str();
@@ -442,6 +465,29 @@ void close_realtime()
         g_xai = nullptr;
     }
     g_secret_header.clear();
+    // Stop the playback task before its borrowed buffers can be reused by another turn.
+    runtime().speaking.store(true);
+    M5.Speaker.end();
+    {
+        std::lock_guard<std::mutex> lock(g_pcm_mu);
+        g_pcm.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mic_send_mu);
+        mic_ring_clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_tool = ToolCall{};
+    }
+    g_audio_failed.store(false);
+    g_turn_done.store(false);
+    g_spoke.store(false);
+    g_ready_beep.store(false);
+    g_awaiting_update.store(false);
+    g_need_update = false;
+    g_listen_deadline_us.store(0);
+    g_play_index = 0;
     cJSON* end = cJSON_CreateObject();
     cJSON_AddStringToObject(end, "type", "session_end");
     char* printed = cJSON_PrintUnformatted(end);
@@ -452,6 +498,10 @@ void close_realtime()
     }
     runtime().speaking.store(false);
     runtime().face.store(FaceState::Idle);
+    ESP_LOGI(kTag, "session closed; internal free %u largest %u; voice stack watermark %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void mark_played_if_spoken()
@@ -473,6 +523,7 @@ void mark_played_if_spoken()
 
 void inject_text(const SpeakItem& item)
 {
+    g_turn_done.store(false);
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "conversation.item.create");
     cJSON* msg = cJSON_AddObjectToObject(root, "item");
@@ -501,37 +552,21 @@ void answer_tool()
     ToolCall call;
     {
         std::lock_guard<std::mutex> lock(g_mu);
-        if (!g_tool.pending) return;
+        if (!g_tool.pending || !g_turn_done.load()) return;
         call = g_tool;
         g_tool.pending = false;
     }
-    std::string task = call.arguments;
-    cJSON* args = cJSON_Parse(call.arguments.c_str());
-    if (args != nullptr) {
-        const cJSON* field = cJSON_GetObjectItemCaseSensitive(args, "task");
-        if (!cJSON_IsString(field)) field = cJSON_GetObjectItemCaseSensitive(args, "text");
-        if (cJSON_IsString(field)) task = field->valuestring;
-        cJSON_Delete(args);
-    }
-    if (task.size() > 2000) task.resize(2000);
-    DeviceConfig cfg;
-    cJSON* body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "text", task.c_str());
-    cJSON_AddBoolToObject(body, "interrupt", g_interrupt.exchange(false));
-    char* printed = cJSON_PrintUnformatted(body);
-    cJSON_Delete(body);
-    std::string response;
-    bool posted = false;
-    if (printed != nullptr && config_load(cfg)) posted = worker_post(cfg, "/ask", printed, response);
-    if (printed != nullptr) cJSON_free(printed);
-    ESP_LOGI(kTag, "ask_bot %s", posted ? "sent" : "failed");
+    // The worker websocket accepts session/state events, not ask requests. Do not
+    // start another TLS client while realtime owns the scarce internal TLS heap.
+    ESP_LOGW(kTag, "ask_bot unavailable during realtime; no HTTPS request opened");
+    g_turn_done.store(false);
 
     cJSON* out = cJSON_CreateObject();
     cJSON_AddStringToObject(out, "type", "conversation.item.create");
     cJSON* item = cJSON_AddObjectToObject(out, "item");
     cJSON_AddStringToObject(item, "type", "function_call_output");
     cJSON_AddStringToObject(item, "call_id", call.call_id.c_str());
-    cJSON_AddStringToObject(item, "output", posted ? "{\"status\":\"sent\"}" : "{\"status\":\"failed\"}");
+    cJSON_AddStringToObject(item, "output", "{\"status\":\"failed\",\"reason\":\"bot handoff unavailable during voice; do not retry\"}");
     char* out_json = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     if (out_json != nullptr) {
@@ -556,31 +591,40 @@ bool tool_pending()
 
 void play_some()
 {
-    constexpr std::size_t kPlayChunk = 3200; // 200 ms at 16 kHz
-    static std::int16_t chunk[kPlayChunk]; // not on the 8 KB voice task stack
-    std::size_t n = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_pcm_mu);
-        n = g_pcm.size() < kPlayChunk ? g_pcm.size() : kPlayChunk;
-        for (std::size_t i = 0; i < n; ++i) {
-            chunk[i] = g_pcm.front();
-            g_pcm.pop_front();
-        }
-    }
-    if (n == 0) {
-        if (!M5.Speaker.isPlaying()) runtime().speaking.store(false);
+    // playRaw borrows memory. Keep three buffers in rotation and at most two
+    // requests on one channel, rather than overwriting one live buffer or mixing
+    // each new chunk onto an automatically selected channel.
+    if (M5.Speaker.isPlaying(0) >= 2) return;
+    if (!pcm_pending()) {
+        if (!M5.Speaker.isPlaying() && (!g_spoke.load() || g_turn_done.load())) runtime().speaking.store(false);
         return;
     }
-    // The wake task owns the microphone. Raising speaking makes it call MicGate::close.
-    if (!speaker_ready()) return;
+    if (!speaker_ready()) {
+        g_audio_failed.store(true);
+        return;
+    }
+    std::int16_t* chunk = g_audio_storage + kPcmCap + g_play_index * kPlayChunk;
+    std::size_t n = 0;
+    std::size_t queued = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_pcm_mu);
+        n = g_pcm.pop(chunk, kPlayChunk);
+        queued = g_pcm.size();
+    }
+    if (n == 0) return;
     runtime().face.store(FaceState::Speaking);
     static std::int64_t last_log = 0;
     if (esp_timer_get_time() - last_log > 1000000) {
         last_log = esp_timer_get_time();
-        ESP_LOGI(kTag, "speaker play %u samples, queued %u, ok=%d", (unsigned)n, (unsigned)g_pcm.size(),
+        ESP_LOGI(kTag, "speaker play %u samples, queued %u, ok=%d", (unsigned)n, (unsigned)queued,
                  (int)M5.Speaker.isEnabled());
     }
-    M5.Speaker.playRaw(chunk, n, 16000, false);
+    if (!M5.Speaker.playRaw(chunk, n, 16000, false, 1, 0, false)) {
+        ESP_LOGE(kTag, "speaker rejected PCM; ending turn");
+        g_audio_failed.store(true);
+        return;
+    }
+    g_play_index = (g_play_index + 1) % kPlayBuffers;
     lip_feed(chunk, n);
 }
 
@@ -598,7 +642,7 @@ void voice_task(void*)
                 have = true;
             }
         }
-        if (!g_want.load() && !have && !tool_pending() && !g_connected.load()) {
+        if (!g_want.load() && !have && !tool_pending() && !g_connected.load() && g_xai == nullptr) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -615,27 +659,24 @@ void voice_task(void*)
             if (g_xai != nullptr) {
                 // A dropped client. End this turn. Minting again spends another reservation
                 // and plays another ready chime, which sounded like a second wake.
-                esp_websocket_client_stop(g_xai);
-                esp_websocket_client_destroy(g_xai);
-                g_xai = nullptr;
-                g_secret_header.clear();
                 ESP_LOGW(kTag, "realtime dropped; ending turn instead of opening another session; heap %u",
                          (unsigned)esp_get_free_heap_size());
-                worker_send_text("{\"type\":\"session_end\"}");
-                g_listen_deadline_us.store(0);
-                runtime().session_deadline_us.store(0);
                 runtime().listening.store(false);
-                runtime().speaking.store(false);
                 if (!runtime().ptt.load()) g_want.store(false);
-                runtime().face.store(FaceState::Idle);
-                {
-                    std::lock_guard<std::mutex> lock(g_mic_send_mu);
-                    mic_ring_clear();
-                }
+                close_realtime();
                 continue;
             }
             ESP_LOGI(kTag, "opening realtime session");
             if (!open_realtime()) {
+                // A successful mint has already spent an hourly grant. Do not
+                // silently reserve another token if client creation/start fails.
+                if (!g_secret_header.empty()) {
+                    close_realtime();
+                    runtime().listening.store(false);
+                    g_want.store(false);
+                    g_open_failures = 0;
+                    continue;
+                }
                 // The Worker answers 429 while its session, hourly, or daily cap is hit.
                 // Give up after three tries so the face does not stay in Listening forever.
                 if (++g_open_failures >= 3) {
@@ -661,9 +702,8 @@ void voice_task(void*)
             g_open_failures = 0;
             for (int i = 0; i < 50 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (g_need_update && g_connected.load()) {
+        if (g_connected.load() && g_need_update.exchange(false)) {
             // Send once per connection. Re-sending every loop produced several session.updated.
-            g_need_update = false;
             g_awaiting_update.store(true);
             send_session_update();
         }
@@ -708,7 +748,12 @@ void voice_task(void*)
         }
         flush_mic_to_xai();
         play_some();
-        if (g_turn_done.load() && !pcm_pending() && !M5.Speaker.isPlaying()) {
+        if (g_audio_failed.load()) {
+            runtime().listening.store(false);
+            g_want.store(false);
+            close_realtime();
+        }
+        if (g_turn_done.load() && !tool_pending() && !pcm_pending() && !M5.Speaker.isPlaying()) {
             g_turn_done.store(false);
             mark_played_if_spoken();
             if (!runtime().ptt.load()) {

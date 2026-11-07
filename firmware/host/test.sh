@@ -12,3 +12,5 @@ g++ -std=c++20 \
   -o /tmp/jarvis-host-logic
 /tmp/jarvis-host-logic
 python3 "$ROOT/host/test_hmac.py"
+g++ -std=c++20 -Wall -Wextra -Werror -I "$ROOT/main" "$ROOT/host/test_pcm_ring.cpp" -o /tmp/jarvis-host-pcm
+/tmp/jarvis-host-pcm
