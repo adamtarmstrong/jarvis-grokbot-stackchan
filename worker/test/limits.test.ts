@@ -2,7 +2,7 @@ import { env, fetchMock } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { rateLimit } from "../src/index";
 import { keys } from "../src/state";
-import { authed, mockXai, openSocket, prefix, resetHub, seedHub, waitFor } from "./helpers";
+import { authed, mockXai, openSocket, prefix, readHub, resetHub, seedHub, waitFor } from "./helpers";
 
 beforeAll(() => {
   fetchMock.activate();
@@ -45,6 +45,35 @@ describe("session and spend caps", () => {
     await seedHub({ grants: [now, now, now, now, now, now] });
     const response = await authed(`${prefix}/token`, "POST", "{}");
     expect(response.status).toBe(429);
+  });
+
+  it("charges one minute and keeps the hourly grant when a short session ends", async () => {
+    mockXai();
+    const socket = await openSocket();
+    expect((await authed(`${prefix}/token`, "POST", "{}")).status).toBe(200);
+    const ended = waitFor(socket, (message) => message.type === "session_end");
+    socket.send(JSON.stringify({ type: "session_end" }));
+    expect((await ended).ok).toBe(true);
+    const daily = await readHub<{ day: string; minutes: number }>(keys.daily);
+    expect(daily?.minutes).toBe(1);
+    const grants = await readHub<number[]>(keys.grants);
+    expect(grants).toHaveLength(1);
+    socket.close();
+  });
+
+  it("does not refund an hourly slot, so six short talks still hit the hourly cap", async () => {
+    const socket = await openSocket();
+    for (let i = 0; i < 6; i++) {
+      mockXai();
+      expect((await authed(`${prefix}/token`, "POST", "{}")).status).toBe(200);
+      const ended = waitFor(socket, (message) => message.type === "session_end");
+      socket.send(JSON.stringify({ type: "session_end" }));
+      expect((await ended).ok).toBe(true);
+    }
+    const daily = await readHub<{ day: string; minutes: number }>(keys.daily);
+    expect(daily?.minutes).toBe(6);
+    expect((await authed(`${prefix}/token`, "POST", "{}")).status).toBe(429);
+    socket.close();
   });
 
   it("releases a reservation when xAI fails so the next try can proceed", async () => {

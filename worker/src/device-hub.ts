@@ -5,6 +5,7 @@ import {
   markTold,
   releaseSession,
   reserveSession,
+  settleSession,
   untoldTimeouts,
   type RequestRecord,
 } from "./state";
@@ -82,7 +83,7 @@ export class DeviceHub implements DurableObject {
     const msg = parseMessage(message);
     if (!msg) return;
     if (msg.type === "session_end") {
-      await this.ctx.storage.delete(keys.session);
+      await settleSession(this.ctx.storage, Date.now());
       ws.send(JSON.stringify({ type: "session_end", ok: true }));
       return;
     }

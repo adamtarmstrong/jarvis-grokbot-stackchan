@@ -88,6 +88,26 @@ export async function reserveSession(
   return reason;
 }
 
+export function sessionMinutesUsed(grantedAt: number, now: number, charge: number): number {
+  if (charge <= 0) return 0;
+  if (now <= grantedAt) return 1;
+  return Math.min(charge, Math.max(1, Math.ceil((now - grantedAt) / 60_000)));
+}
+
+/** End a live reservation: charge elapsed whole minutes (minimum 1) and keep the hourly grant. */
+export async function settleSession(storage: DurableObjectStorage, now: number): Promise<void> {
+  await storage.transaction(async (txn) => {
+    const session = await txn.get<SessionRecord>(keys.session);
+    if (!session) return;
+    await txn.delete(keys.session);
+    const daily = await txn.get<DailyRecord>(keys.daily);
+    if (!daily || daily.day !== utcDay(session.grantedAt)) return;
+    const used = sessionMinutesUsed(session.grantedAt, now, session.charge);
+    daily.minutes = Math.max(0, daily.minutes - session.charge + used);
+    await txn.put(keys.daily, daily);
+  });
+}
+
 export async function releaseSession(storage: DurableObjectStorage, reservationId: string): Promise<void> {
   await storage.transaction(async (txn) => {
     const session = await txn.get<SessionRecord>(keys.session);

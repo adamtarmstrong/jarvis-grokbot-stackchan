@@ -93,6 +93,14 @@ export async function seedHub(entries: Record<string, unknown>): Promise<void> {
   });
 }
 
+export async function readHub<T>(key: string): Promise<T | undefined> {
+  const stub = env.DEVICE_HUB.get(env.DEVICE_HUB.idFromName(env.DEVICE_ID));
+  const { runInDurableObject } = await import("cloudflare:test");
+  return runInDurableObject(stub, async (_instance: unknown, state: DurableObjectState) => {
+    return state.storage.get<T>(key);
+  });
+}
+
 export async function readRequest(id: string): Promise<RequestRecord | undefined> {
   const stub = env.DEVICE_HUB.get(env.DEVICE_HUB.idFromName(env.DEVICE_ID));
   const { runInDurableObject } = await import("cloudflare:test");
