@@ -117,6 +117,15 @@ std::size_t mic_ring_pop(std::int16_t* dest, std::size_t max)
     return n;
 }
 
+void mic_ring_keep_latest(std::size_t max_samples)
+{
+    if (g_mic_n <= max_samples) return;
+    const std::size_t drop = g_mic_n - max_samples;
+    g_mic_r += drop;
+    if (g_mic_r >= kMicSendCap) g_mic_r -= kMicSendCap;
+    g_mic_n = max_samples;
+}
+
 // Speaker and microphone share one I2S controller. Raise speaking so the wake task closes
 // the mic, then start the speaker. Returns false if the speaker would not start.
 bool speaker_ready()
@@ -202,12 +211,14 @@ void flush_mic_to_xai()
     // Wait until session.updated so format and server VAD apply to this audio.
     if (g_need_update || g_awaiting_update.load()) return;
 
-    constexpr std::size_t kChunk = 1600;
+    constexpr std::size_t kChunk = 800;
     std::int16_t chunk[kChunk];
     std::size_t n = 0;
+    std::size_t remaining = 0;
     {
         std::lock_guard<std::mutex> lock(g_mic_send_mu);
         n = mic_ring_pop(chunk, kChunk);
+        remaining = g_mic_n;
     }
     if (n == 0) return;
 
@@ -232,8 +243,8 @@ void flush_mic_to_xai()
     }
     count += n;
     if ((appends++ % 50) == 0) {
-        ESP_LOGI(kTag, "mic append #%u (%u samples, pcm16 16 kHz mono LE b64) rms %d peak %d", appends, (unsigned)n,
-                 static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak);
+        ESP_LOGI(kTag, "mic append #%u (%u samples, pcm16 16 kHz mono LE b64) rms %d peak %d, ring %u", appends,
+                 (unsigned)n, static_cast<int>(std::sqrt(sum_sq / (count ? count : 1))), peak, (unsigned)remaining);
         peak = 0;
         sum_sq = 0;
         count = 0;
@@ -244,8 +255,17 @@ void send_xai(const char* json)
 {
     if (g_xai == nullptr || json == nullptr) return;
     if (!esp_websocket_client_is_connected(g_xai)) return;
-    const int sent = esp_websocket_client_send_text(g_xai, json, static_cast<int>(std::strlen(json)), pdMS_TO_TICKS(3000));
-    if (sent < 0) ESP_LOGW(kTag, "realtime send failed (%u bytes)", (unsigned)std::strlen(json));
+    const int nbytes = static_cast<int>(std::strlen(json));
+    const auto t0 = esp_timer_get_time();
+    // 3 s was shorter than a single TCP retransmit against the 5760-byte send
+    // window. The IDF client closes the socket if poll_write times out.
+    const int sent = esp_websocket_client_send_text(g_xai, json, nbytes, pdMS_TO_TICKS(15000));
+    const int elapsed_ms = static_cast<int>((esp_timer_get_time() - t0) / 1000);
+    if (sent < 0) {
+        ESP_LOGW(kTag, "realtime send failed (%d bytes, %d ms)", nbytes, elapsed_ms);
+    } else if (elapsed_ms >= 200) {
+        ESP_LOGI(kTag, "realtime send slow (%d bytes in %d ms)", nbytes, elapsed_ms);
+    }
 }
 
 void queue_pcm(const std::uint8_t* data, std::size_t len)
@@ -724,6 +744,13 @@ void voice_task(void*)
             }
             runtime().speaking.store(false);
             runtime().face.store(FaceState::Listening);
+            {
+                std::lock_guard<std::mutex> lock(g_mic_send_mu);
+                const std::size_t before = g_mic_n;
+                constexpr std::size_t kPreRoll = 4800; // 300 ms at 16 kHz
+                mic_ring_keep_latest(kPreRoll);
+                ESP_LOGI(kTag, "listen pre-roll kept %u of %u samples", (unsigned)g_mic_n, (unsigned)before);
+            }
             if (runtime().listening.load()) g_listen_deadline_us.store(esp_timer_get_time() + kListenWindowUs);
             ESP_LOGI(kTag, "ready chime played; listening for 8 s");
         }
