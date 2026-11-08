@@ -57,7 +57,11 @@ std::string g_voice = "leo";
 std::int64_t g_expires_at = 0;
 std::atomic<bool> g_need_update{false};
 std::atomic<bool> g_awaiting_update{false};
-std::string g_rx;
+constexpr std::size_t kRxCap = 262144; // assemble large audio-delta JSON in PSRAM
+char* g_rx_buf = nullptr;
+std::size_t g_rx_len = 0;
+bool g_rx_drop = false;
+
 std::string g_active_reply;
 std::atomic<bool> g_spoke{false};
 int g_open_failures = 0;
@@ -187,8 +191,23 @@ std::int16_t* g_audio_storage = nullptr;
 std::size_t g_play_index = 0;
 std::atomic<bool> g_audio_failed{false};
 
+bool rx_ensure()
+{
+    if (g_rx_buf != nullptr) return true;
+    g_rx_buf = static_cast<char*>(heap_caps_malloc(kRxCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_rx_buf == nullptr) {
+        ESP_LOGE(kTag, "rx PSRAM alloc failed");
+        return false;
+    }
+    g_rx_len = 0;
+    g_rx_drop = false;
+    ESP_LOGI(kTag, "rx assembly buffer ready in PSRAM (%u bytes)", (unsigned)kRxCap);
+    return true;
+}
+
 bool audio_storage_ensure()
 {
+    if (!rx_ensure()) return false;
     std::lock_guard<std::mutex> lock(g_pcm_mu);
     if (g_audio_storage != nullptr) return true;
     g_audio_storage = static_cast<std::int16_t*>(heap_caps_malloc(
@@ -292,6 +311,12 @@ void note_audio_delta(const cJSON* root)
     g_spoke = true;
     runtime().speaking.store(true);
     runtime().face.store(FaceState::Speaking);
+    static unsigned audio_deltas = 0;
+    if ((audio_deltas++ % 25) == 0) {
+        std::lock_guard<std::mutex> lock(g_pcm_mu);
+        ESP_LOGI(kTag, "audio delta #%u +%u bytes, queued %u samples", audio_deltas, (unsigned)pcm.size(),
+                 (unsigned)g_pcm.size());
+    }
 }
 
 void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
@@ -318,16 +343,26 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
     if (id != WEBSOCKET_EVENT_DATA || data == nullptr) return;
     const auto* evt = static_cast<esp_websocket_event_data_t*>(data);
     if (evt->op_code != 0x1 || evt->data_ptr == nullptr || evt->data_len <= 0) return;
-    if (evt->payload_offset == 0) g_rx.clear();
-    if (g_rx.size() + static_cast<std::size_t>(evt->data_len) > 16384) {
-        g_rx.clear();
+    if (evt->payload_offset == 0) {
+        g_rx_len = 0;
+        g_rx_drop = false;
+    }
+    if (g_rx_drop) return;
+    if (!rx_ensure()) return;
+    const auto chunk_n = static_cast<std::size_t>(evt->data_len);
+    if (g_rx_len + chunk_n > kRxCap) {
+        ESP_LOGW(kTag, "dropping oversized ws event (%u + %u > %u, payload %u)", (unsigned)g_rx_len,
+                 (unsigned)chunk_n, (unsigned)kRxCap, (unsigned)evt->payload_len);
+        g_rx_len = 0;
+        g_rx_drop = true;
         return;
     }
-    g_rx.append(evt->data_ptr, static_cast<std::size_t>(evt->data_len));
+    std::memcpy(g_rx_buf + g_rx_len, evt->data_ptr, chunk_n);
+    g_rx_len += chunk_n;
     if (evt->payload_offset + evt->data_len < evt->payload_len) return;
 
-    cJSON* root = cJSON_ParseWithLength(g_rx.c_str(), g_rx.size());
-    g_rx.clear();
+    cJSON* root = cJSON_ParseWithLength(g_rx_buf, g_rx_len);
+    g_rx_len = 0;
     if (root == nullptr) return;
     const cJSON* type = cJSON_GetObjectItemCaseSensitive(root, "type");
     if (!cJSON_IsString(type)) {
