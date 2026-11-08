@@ -48,6 +48,8 @@ std::deque<SpeakItem> g_speak;
 std::atomic<bool> g_want{false};
 std::atomic<bool> g_interrupt{false};
 std::atomic<bool> g_connected{false};
+std::atomic<bool> g_saw_connected{false};
+std::atomic<bool> g_closing{false};
 std::atomic<bool> g_turn_done{false};
 std::atomic<bool> g_started{false};
 esp_websocket_client_handle_t g_xai = nullptr;
@@ -326,8 +328,13 @@ void note_audio_delta(const cJSON* root)
 void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
 {
     if (id == WEBSOCKET_EVENT_CONNECTED) {
+        if (g_closing.load()) {
+            ESP_LOGW(kTag, "realtime connected after close; ignoring");
+            return;
+        }
         ESP_LOGI(kTag, "realtime connected");
         g_connected.store(true);
+        g_saw_connected.store(true);
         g_need_update = true;
         runtime().session_deadline_us.store(esp_timer_get_time() + kMaxSessionUs);
         return;
@@ -505,7 +512,10 @@ bool open_realtime()
     g_xai = esp_websocket_client_init(&ws);
     if (g_xai == nullptr) return false;
     esp_websocket_register_events(g_xai, WEBSOCKET_EVENT_ANY, xai_event, nullptr);
+    g_saw_connected.store(false);
+    g_closing.store(false);
     if (esp_websocket_client_start(g_xai) != ESP_OK) {
+        g_closing.store(true);
         esp_websocket_client_destroy(g_xai);
         g_xai = nullptr;
         return false;
@@ -516,13 +526,16 @@ bool open_realtime()
 
 void close_realtime()
 {
+    g_closing.store(true);
     g_connected.store(false);
+    g_saw_connected.store(false);
     runtime().session_deadline_us.store(0);
     if (g_xai != nullptr) {
         esp_websocket_client_stop(g_xai);
         esp_websocket_client_destroy(g_xai);
         g_xai = nullptr;
     }
+    g_connected.store(false);
     g_secret_header.clear();
     // Stop the playback task before its borrowed buffers can be reused by another turn.
     runtime().speaking.store(true);
@@ -716,13 +729,21 @@ void voice_task(void*)
         }
         if (g_xai == nullptr || !g_connected.load()) {
             if (g_xai != nullptr) {
-                // A dropped client. End this turn. Minting again spends another reservation
-                // and plays another ready chime, which sounded like a second wake.
-                ESP_LOGW(kTag, "realtime dropped; ending turn instead of opening another session; heap %u",
-                         (unsigned)esp_get_free_heap_size());
+                // A dropped client, or the handshake never finished. End this turn.
+                // Minting again spends another reservation and can play another ready chime.
+                if (g_saw_connected.load()) {
+                    ESP_LOGW(kTag, "realtime dropped; ending turn instead of opening another session; heap %u",
+                             (unsigned)esp_get_free_heap_size());
+                } else {
+                    ESP_LOGW(kTag, "realtime connect timed out; ending turn; heap %u",
+                             (unsigned)esp_get_free_heap_size());
+                }
                 runtime().listening.store(false);
                 if (!runtime().ptt.load()) g_want.store(false);
                 close_realtime();
+                continue;
+            }
+            if (!g_want.load() && !have && !runtime().ptt.load()) {
                 continue;
             }
             ESP_LOGI(kTag, "opening realtime session");
@@ -759,7 +780,9 @@ void voice_task(void*)
                 continue;
             }
             g_open_failures = 0;
-            for (int i = 0; i < 50 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
+            // TLS over a weak AP can take longer than 5 s; giving up early tears down a
+            // handshake that then completes and used to open a second session.
+            for (int i = 0; i < 200 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (g_connected.load() && g_need_update.exchange(false)) {
             // Send once per connection. Re-sending every loop produced several session.updated.
