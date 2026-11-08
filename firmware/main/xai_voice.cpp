@@ -68,6 +68,7 @@ int g_open_failures = 0;
 std::atomic<bool> g_ready_beep{false};
 std::atomic<bool> g_ack_beep{false};
 std::atomic<std::int64_t> g_listen_deadline_us{0};
+std::atomic<std::int64_t> g_next_mic_send_us{0};
 constexpr std::int64_t kListenWindowUs = 8'000'000;
 std::mutex g_mic_send_mu;
 constexpr std::size_t kMicSendCap = 80'000; // 5 s at 16 kHz, kept in PSRAM so TLS can use internal RAM
@@ -229,6 +230,8 @@ void flush_mic_to_xai()
     if (!runtime().ptt.load() && !runtime().listening.load()) return;
     // Wait until session.updated so format and server VAD apply to this audio.
     if (g_need_update || g_awaiting_update.load()) return;
+    const auto now = esp_timer_get_time();
+    if (now < g_next_mic_send_us.load()) return;
 
     constexpr std::size_t kChunk = 800;
     std::int16_t chunk[kChunk];
@@ -250,6 +253,7 @@ void flush_mic_to_xai()
     if (printed == nullptr) return;
     send_xai(printed);
     cJSON_free(printed);
+    g_next_mic_send_us.store(esp_timer_get_time() + static_cast<std::int64_t>(n) * 1000000 / 16000);
 
     static unsigned appends = 0;
     static int peak = 0;
@@ -280,8 +284,8 @@ void send_xai(const char* json)
     // window. The IDF client closes the socket if poll_write times out.
     const int sent = esp_websocket_client_send_text(g_xai, json, nbytes, pdMS_TO_TICKS(15000));
     const int elapsed_ms = static_cast<int>((esp_timer_get_time() - t0) / 1000);
-    if (sent < 0) {
-        ESP_LOGW(kTag, "realtime send failed (%d bytes, %d ms)", nbytes, elapsed_ms);
+    if (sent <= 0) {
+        ESP_LOGW(kTag, "realtime send failed (%d bytes, sent %d, %d ms)", nbytes, sent, elapsed_ms);
     } else if (elapsed_ms >= 200) {
         ESP_LOGI(kTag, "realtime send slow (%d bytes in %d ms)", nbytes, elapsed_ms);
     }
@@ -786,6 +790,7 @@ void voice_task(void*)
                 mic_ring_keep_latest(kPreRoll);
                 ESP_LOGI(kTag, "listen pre-roll kept %u of %u samples", (unsigned)g_mic_n, (unsigned)before);
             }
+            g_next_mic_send_us.store(0);
             if (runtime().listening.load()) g_listen_deadline_us.store(esp_timer_get_time() + kListenWindowUs);
             ESP_LOGI(kTag, "ready chime played; listening for 8 s");
         }
