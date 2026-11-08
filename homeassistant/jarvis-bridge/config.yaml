@@ -1,0 +1,44 @@
+name: Jarvis Bridge
+version: "0.1.0"
+slug: jarvis_bridge
+description: Local StackChan speech recognition and Piper voice with Jarvis webhook replies
+arch: [aarch64, amd64]
+startup: application
+boot: auto
+init: true
+stage: experimental
+ports:
+  10700/tcp: 10700
+ports_description:
+  10700/tcp: StackChan LAN WebSocket (trusted LAN only)
+map:
+  - type: share
+    read_only: true
+options:
+  bind_port: 10700
+  bridge_key: ""
+  worker_url: ""
+  device_id: ""
+  device_token: ""
+  hmac_key: ""
+  webhook_url: ""
+  webhook_key: ""
+  public_reply_url: ""
+  reply_timeout: 40
+  piper_voice: en_GB-alan-medium
+  custom_voice: ""
+  stt_model: base.en
+schema:
+  bind_port: "int(10700,10700)"
+  bridge_key: password
+  worker_url: str
+  device_id: str
+  device_token: password
+  hmac_key: password
+  webhook_url: str
+  webhook_key: password
+  public_reply_url: str
+  reply_timeout: "int(1,50)"
+  piper_voice: "list(en_GB-alan-medium)"
+  custom_voice: str
+  stt_model: "list(tiny.en|base.en|small.en)"

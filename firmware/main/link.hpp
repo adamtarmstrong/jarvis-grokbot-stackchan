@@ -12,6 +12,14 @@ struct DeviceConfig {
     std::string device_id;
     std::string device_token;
     std::string hmac_key;
+    std::string ha_url; // ws://Pi-IP:10700/voice; nonempty selects LAN voice, never xAI
+    std::string ha_key; // LAN bridge pairing key, stored only in NVS
+    // Reserved settings hooks. Camera/tracking and palette application are not enabled yet.
+    std::string follow_enabled = "1";
+    std::string follow_days = "1234567"; // Monday=1 ... Sunday=7
+    std::string follow_start = "08:00";
+    std::string follow_end = "17:00";
+    std::string robot_color = "white";
     std::string ota_url;
 };
 

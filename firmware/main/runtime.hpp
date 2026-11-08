@@ -19,7 +19,7 @@ inline eyes::Mood mood_for(FaceState state)
     case FaceState::Speaking:
         return eyes::Mood::Speaking;
     case FaceState::Connecting:
-        return eyes::Mood::Curious;  // waiting for the realtime session; do not speak yet
+        return eyes::Mood::Curious;  // legacy realtime connection; HA buffers speech immediately
     case FaceState::Sleeping:
         return eyes::Mood::Sleepy;
     case FaceState::Idle:
@@ -28,7 +28,7 @@ inline eyes::Mood mood_for(FaceState state)
     return eyes::Mood::Idle;
 }
 
-// Hard cap on an xAI realtime session. The voice task closes at this mark.
+// Hard cap on a voice turn. Both transports close at this mark.
 constexpr std::int64_t kMaxSessionUs = 60'000'000;
 
 // Face and privacy tasks read these. Audio code writes them.

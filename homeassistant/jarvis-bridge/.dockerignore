@@ -1,0 +1,7 @@
+__pycache__/
+tests/
+*.onnx
+*.onnx.json
+*.wav
+*.pcm
+*.part

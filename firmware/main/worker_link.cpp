@@ -310,8 +310,16 @@ bool config_load(DeviceConfig& out)
     const bool ok = nvs_get(handle, "worker_base", out.worker_base) && nvs_get(handle, "path_prefix", out.path_prefix) &&
                     nvs_get(handle, "device_id", out.device_id) && nvs_get(handle, "device_token", out.device_token) &&
                     nvs_get(handle, "hmac_key", out.hmac_key);
+    nvs_get(handle, "ha_url", out.ha_url);
+    nvs_get(handle, "ha_key", out.ha_key);
+    nvs_get(handle, "follow_enabled", out.follow_enabled);
+    nvs_get(handle, "follow_days", out.follow_days);
+    nvs_get(handle, "follow_start", out.follow_start);
+    nvs_get(handle, "follow_end", out.follow_end);
+    nvs_get(handle, "robot_color", out.robot_color);
     nvs_get(handle, "ota_url", out.ota_url);
     nvs_close(handle);
+    if (!out.ha_url.empty()) return out.ha_url.rfind("ws://", 0) == 0 && out.ha_key.size() >= 16;
     return ok && https_base(out.worker_base);
 }
 
@@ -321,7 +329,11 @@ bool config_save(const DeviceConfig& cfg)
     if (nvs_open(kNs, NVS_READWRITE, &handle) != ESP_OK) return false;
     const bool ok = nvs_put(handle, "worker_base", cfg.worker_base) && nvs_put(handle, "path_prefix", cfg.path_prefix) &&
                     nvs_put(handle, "device_id", cfg.device_id) && nvs_put(handle, "device_token", cfg.device_token) &&
-                    nvs_put(handle, "hmac_key", cfg.hmac_key);
+                    nvs_put(handle, "hmac_key", cfg.hmac_key) &&
+                    nvs_put(handle, "ha_url", cfg.ha_url) && nvs_put(handle, "ha_key", cfg.ha_key) &&
+                    nvs_put(handle, "follow_enabled", cfg.follow_enabled) && nvs_put(handle, "follow_days", cfg.follow_days) &&
+                    nvs_put(handle, "follow_start", cfg.follow_start) && nvs_put(handle, "follow_end", cfg.follow_end) &&
+                    nvs_put(handle, "robot_color", cfg.robot_color);
     if (!cfg.ota_url.empty()) nvs_put(handle, "ota_url", cfg.ota_url);
     const esp_err_t committed = nvs_commit(handle);
     nvs_close(handle);
@@ -336,6 +348,11 @@ bool config_is_ready()
 {
     DeviceConfig cfg;
     if (!config_load(cfg)) return false;
+    if (!cfg.ha_url.empty()) {
+        g_cfg = cfg;
+        g_cfg_ready = true;
+        return true;
+    }
     if (cfg.path_prefix.size() < 8 || cfg.path_prefix.find('/') != std::string::npos) return false;
     g_cfg = cfg;
     g_cfg_ready = true;

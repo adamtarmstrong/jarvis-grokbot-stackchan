@@ -138,11 +138,22 @@ esp_err_t page_get(httpd_req_t* req)
         "<form method=post action=/save>"
         "<label>Wi-Fi name<br><input name=ssid required maxlength=32></label><br>"
         "<label>Wi-Fi password<br><input name=pass type=password maxlength=64></label><br>"
-        "<label>Worker URL<br><input name=worker_base required placeholder=https://your-worker.example></label><br>"
-        "<label>Path prefix<br><input name=path_prefix required minlength=8></label><br>"
-        "<label>Device id<br><input name=device_id required></label><br>"
-        "<label>Device token<br><input name=device_token type=password required></label><br>"
-        "<label>HMAC key<br><input name=hmac_key type=password required></label><br>"
+        "<label>Home Assistant bridge URL<br><input name=ha_url maxlength=192 placeholder=ws://192.168.1.50:10700/voice></label><br>"
+        "<label>Bridge pairing key<br><input name=ha_key type=password maxlength=128></label><br>"
+        "<p>With a bridge URL, Worker credentials below are optional (configure them in the add-on instead).</p>"
+        "<fieldset><legend>Future camera and theme settings (stored only; not active in this build)</legend>"
+        "<label>Follow me <select name=follow_enabled><option value=1>Yes</option><option value=0>No</option></select></label><br>"
+        "<label>Days (Monday=1, Sunday=7)<input name=follow_days value=1234567 maxlength=7></label><br>"
+        "<label>Start <input name=follow_start type=time value=08:00></label>"
+        "<label>End <input name=follow_end type=time value=17:00></label><br>"
+        "<p>Schedule timezone: America/Detroit. After hours: no head movement; voice remains available.</p>"
+        "<label>Robot color <select name=robot_color><option>white</option><option>blue</option><option>green</option>"
+        "<option>amber</option><option>red</option></select></label></fieldset>"
+        "<label>Worker URL<br><input name=worker_base placeholder=https://your-worker.example></label><br>"
+        "<label>Path prefix<br><input name=path_prefix minlength=8></label><br>"
+        "<label>Device id<br><input name=device_id></label><br>"
+        "<label>Device token<br><input name=device_token type=password></label><br>"
+        "<label>HMAC key<br><input name=hmac_key type=password></label><br>"
         "<button type=submit>Save</button></form></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, kPage, sizeof(kPage) - 1);
@@ -165,6 +176,13 @@ esp_err_t save_post(httpd_req_t* req)
         received += n;
     }
     DeviceConfig cfg;
+    cfg.ha_url = form_value(body, "ha_url");
+    cfg.ha_key = form_value(body, "ha_key");
+    cfg.follow_enabled = form_value(body, "follow_enabled");
+    cfg.follow_days = form_value(body, "follow_days");
+    cfg.follow_start = form_value(body, "follow_start");
+    cfg.follow_end = form_value(body, "follow_end");
+    cfg.robot_color = form_value(body, "robot_color");
     cfg.worker_base = form_value(body, "worker_base");
     cfg.path_prefix = form_value(body, "path_prefix");
     cfg.device_id = form_value(body, "device_id");
@@ -175,9 +193,26 @@ esp_err_t save_post(httpd_req_t* req)
     while (!cfg.worker_base.empty() && cfg.worker_base.back() == '/') cfg.worker_base.pop_back();
     const bool base_ok = cfg.worker_base.rfind("https://", 0) == 0 && cfg.worker_base.find('@') == std::string::npos &&
                          cfg.worker_base.find('/', 8) == std::string::npos;
-    if (!base_ok || !prefix_ok(cfg.path_prefix) || cfg.device_id.empty() || cfg.device_id.size() > 64 ||
-        cfg.device_token.size() < 16 || cfg.hmac_key.size() < 16 || ssid.empty() || ssid.size() > 32) {
-        httpd_resp_send(req, "Check the Worker URL, path prefix, and that the token and HMAC key are filled in.", HTTPD_RESP_USE_STRLEN);
+    const bool legacy_ok = base_ok && prefix_ok(cfg.path_prefix) && !cfg.device_id.empty() && cfg.device_id.size() <= 64 &&
+                           cfg.device_token.size() >= 16 && cfg.hmac_key.size() >= 16;
+    const bool ha_ok = cfg.ha_url.rfind("ws://", 0) == 0 && cfg.ha_url.size() <= 192 && cfg.ha_url.size() > 12 &&
+                       cfg.ha_url.find('@') == std::string::npos && cfg.ha_url.find('?') == std::string::npos &&
+                       cfg.ha_url.find('#') == std::string::npos && cfg.ha_url.find_first_of("\r\n ") == std::string::npos &&
+                       cfg.ha_url.compare(cfg.ha_url.size() - 6, 6, "/voice") == 0 &&
+                       cfg.ha_key.size() >= 16 && cfg.ha_key.size() <= 128 && cfg.ha_key.find_first_of("\r\n") == std::string::npos;
+    auto time_ok = [](const std::string& value) {
+        return value.size() == 5 && value[2] == ':' && value[0] >= '0' && value[0] <= '2' &&
+               value[1] >= '0' && value[1] <= '9' && (value[0] != '2' || value[1] <= '3') &&
+               value[3] >= '0' && value[3] <= '5' && value[4] >= '0' && value[4] <= '9';
+    };
+    const bool settings_ok = (cfg.follow_enabled == "0" || cfg.follow_enabled == "1") &&
+                             !cfg.follow_days.empty() && cfg.follow_days.size() <= 7 &&
+                             cfg.follow_days.find_first_not_of("1234567") == std::string::npos &&
+                             time_ok(cfg.follow_start) && time_ok(cfg.follow_end) &&
+                             (cfg.robot_color == "white" || cfg.robot_color == "blue" || cfg.robot_color == "green" ||
+                              cfg.robot_color == "amber" || cfg.robot_color == "red");
+    if ((cfg.ha_url.empty() ? !legacy_ok : !ha_ok) || !settings_ok || ssid.empty() || ssid.size() > 32) {
+        httpd_resp_send(req, "Check Wi-Fi, the bridge URL/key (or legacy Worker credentials), and schedule fields.", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     if (!save_wifi(ssid, pass) || !config_save(cfg)) {

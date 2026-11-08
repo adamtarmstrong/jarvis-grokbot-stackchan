@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jarvis contributors
 //
+// HA LAN path is not yet hardware-tested. Legacy xAI path retained.
 // UNTESTED against a live xAI session. Event names follow the Voice Agent
 // schema checked on 2026-10-19 (session.update, input_audio_buffer.append,
 // response.output_audio.delta, response.function_call_arguments.done).
@@ -56,6 +57,9 @@ esp_websocket_client_handle_t g_xai = nullptr;
 std::string g_secret_header;
 std::string g_realtime_url;
 std::string g_voice = "leo";
+std::atomic<bool> g_ha_mode{false};
+std::atomic<bool> g_ha_capturing{false};
+std::atomic<bool> g_ha_end_requested{false};
 std::int64_t g_expires_at = 0;
 std::atomic<bool> g_need_update{false};
 std::atomic<bool> g_awaiting_update{false};
@@ -73,7 +77,7 @@ std::atomic<std::int64_t> g_listen_deadline_us{0};
 std::atomic<std::int64_t> g_next_mic_send_us{0};
 constexpr std::int64_t kListenWindowUs = 8'000'000;
 std::mutex g_mic_send_mu;
-constexpr std::size_t kMicSendCap = 80'000; // 5 s at 16 kHz, kept in PSRAM so TLS can use internal RAM
+constexpr std::size_t kMicSendCap = 320'000; // 20 s of immediate wake capture in PSRAM while LAN connects
 std::int16_t* g_mic_ring = nullptr;
 std::size_t g_mic_r = 0;
 std::size_t g_mic_w = 0;
@@ -102,6 +106,10 @@ void mic_ring_push(std::int16_t sample)
 {
     if (!mic_ring_ensure()) return;
     if (g_mic_n == kMicSendCap) {
+        if (g_ha_mode.load()) {
+            // Never silently discard the beginning of a LAN request.
+            return;
+        }
         g_mic_r += 1;
         if (g_mic_r == kMicSendCap) g_mic_r = 0;
         g_mic_n -= 1;
@@ -228,6 +236,7 @@ void send_xai(const char* json);
 void flush_mic_to_xai()
 {
     if (g_xai == nullptr || !g_connected.load()) return;
+    if (g_ha_mode.load() && !g_ha_capturing.load()) return;
     if (runtime().speaking.load()) return;
     if (!runtime().ptt.load() && !runtime().listening.load()) return;
     // Wait until session.updated so format and server VAD apply to this audio.
@@ -248,14 +257,14 @@ void flush_mic_to_xai()
 
     const auto encoded = b64_encode(reinterpret_cast<const std::uint8_t*>(chunk), n * sizeof(std::int16_t));
     cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "input_audio_buffer.append");
+    cJSON_AddStringToObject(root, "type", g_ha_mode.load() ? "audio" : "input_audio_buffer.append");
     cJSON_AddStringToObject(root, "audio", encoded.c_str());
     char* printed = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (printed == nullptr) return;
     send_xai(printed);
     cJSON_free(printed);
-    g_next_mic_send_us.store(esp_timer_get_time() + static_cast<std::int64_t>(n) * 1000000 / 16000);
+    g_next_mic_send_us.store(g_ha_mode.load() ? 0 : esp_timer_get_time() + static_cast<std::int64_t>(n) * 1000000 / 16000);
 
     static unsigned appends = 0;
     static int peak = 0;
@@ -335,8 +344,8 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         ESP_LOGI(kTag, "realtime connected");
         g_connected.store(true);
         g_saw_connected.store(true);
-        g_need_update = true;
-        runtime().session_deadline_us.store(esp_timer_get_time() + kMaxSessionUs);
+        g_need_update = !g_ha_mode.load();
+        if (!g_ha_mode.load()) runtime().session_deadline_us.store(esp_timer_get_time() + kMaxSessionUs);
         return;
     }
     if (id == WEBSOCKET_EVENT_ERROR || id == WEBSOCKET_EVENT_DISCONNECTED) {
@@ -385,7 +394,16 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
     if (std::strstr(name, "delta") == nullptr) ESP_LOGI(kTag, "event %s", name);
     else if ((deltas++ % 25) == 0) ESP_LOGI(kTag, "%s #%u", name, deltas);
     // Log the event name only. Deltas and transcripts stay off the console.
-    if (std::strcmp(name, "response.output_audio.delta") == 0 || std::strcmp(name, "response.audio.delta") == 0) {
+    if (g_ha_mode.load() && std::strcmp(name, "ready") == 0) {
+        g_ready_beep.store(true);
+    } else if (g_ha_mode.load() && std::strcmp(name, "processing") == 0) {
+        g_ha_capturing.store(false);
+        runtime().listening.store(false);
+        g_listen_deadline_us.store(0);
+        runtime().face.store(FaceState::Thinking);
+    } else if (g_ha_mode.load() && std::strcmp(name, "play") == 0) {
+        runtime().face.store(FaceState::Speaking);
+    } else if (std::strcmp(name, "response.output_audio.delta") == 0 || std::strcmp(name, "response.audio.delta") == 0) {
         note_audio_delta(root);
     } else if (std::strcmp(name, "session.created") == 0 || std::strcmp(name, "conversation.created") == 0) {
         ESP_LOGI(kTag, "%s", name);
@@ -415,7 +433,8 @@ void xai_event(void*, esp_event_base_t, std::int32_t id, void* data)
         if (std::strcmp(name, "response.done") == 0) g_turn_done.store(true);
         ESP_LOGI(kTag, "%s", name);
     } else if (std::strcmp(name, "error") == 0) {
-        ESP_LOGW(kTag, "realtime error event");
+        ESP_LOGW(kTag, "voice error event");
+        if (g_ha_mode.load()) g_audio_failed.store(true);
     }
     cJSON_Delete(root);
 }
@@ -560,12 +579,14 @@ void close_realtime()
     g_need_update = false;
     g_listen_deadline_us.store(0);
     g_play_index = 0;
+    g_ha_capturing.store(false);
+    g_ha_end_requested.store(false);
     cJSON* end = cJSON_CreateObject();
     cJSON_AddStringToObject(end, "type", "session_end");
     char* printed = cJSON_PrintUnformatted(end);
     cJSON_Delete(end);
     if (printed != nullptr) {
-        worker_send_text(printed);
+        if (!g_ha_mode.load()) worker_send_text(printed);
         cJSON_free(printed);
     }
     runtime().speaking.store(false);
@@ -700,9 +721,89 @@ void play_some()
     lip_feed(chunk, n);
 }
 
+bool open_ha(const DeviceConfig& cfg)
+{
+    if (!audio_storage_ensure()) return false;
+    g_realtime_url = cfg.ha_url;
+    g_secret_header = "X-Jarvis-Bridge-Key: " + cfg.ha_key + "\r\n";
+    esp_websocket_client_config_t ws = {};
+    ws.uri = g_realtime_url.c_str();
+    ws.headers = g_secret_header.c_str();
+    ws.buffer_size = 8192;
+    ws.network_timeout_ms = 5000;
+    ws.disable_auto_reconnect = true;
+    g_xai = esp_websocket_client_init(&ws);
+    if (g_xai == nullptr) return false;
+    esp_websocket_register_events(g_xai, WEBSOCKET_EVENT_ANY, xai_event, nullptr);
+    g_closing.store(false);
+    g_saw_connected.store(false);
+    return esp_websocket_client_start(g_xai) == ESP_OK;
+}
+
+void ha_turn(const DeviceConfig& cfg)
+{
+    // One wake -> one reply. No fallback to xAI on connection/pipeline failure.
+    g_ha_capturing.store(false);
+    bool started = false;
+    if (open_ha(cfg)) {
+        for (int i = 0; i < 100 && !g_connected.load(); ++i) vTaskDelay(pdMS_TO_TICKS(100));
+        if (g_connected.load()) {
+            send_xai("{\"type\":\"start_listen\",\"sample_rate\":16000,\"channels\":1,\"format\":\"s16le\"}");
+            started = true;
+        }
+    }
+    const auto ready_deadline = esp_timer_get_time() + 10'000'000;
+    bool ready = false;
+    bool played = false;
+    while (started && g_connected.load() && !g_audio_failed.load()) {
+        const auto now = esp_timer_get_time();
+        const auto deadline = runtime().session_deadline_us.load();
+        if (deadline == 0 || now >= deadline || (!ready && now > ready_deadline)) break;
+        if (g_ready_beep.exchange(false)) {
+            // Visual-only readiness: speech has already been buffering since wake.
+            runtime().speaking.store(false);
+            runtime().listening.store(true);
+            runtime().face.store(FaceState::Listening);
+            g_next_mic_send_us.store(0);
+            g_ha_capturing.store(true);
+            ready = true;
+        }
+        if (ready && g_ha_end_requested.exchange(false) && g_ha_capturing.exchange(false)) {
+            // Drain mic tail on touch-release before ending input.
+            for (;;) {
+                std::int16_t chunk[800];
+                std::size_t n;
+                { std::lock_guard<std::mutex> lock(g_mic_send_mu); n = mic_ring_pop(chunk, 800); }
+                if (n == 0) break;
+                const auto encoded = b64_encode(reinterpret_cast<const std::uint8_t*>(chunk), n * sizeof(std::int16_t));
+                const std::string event = "{\"type\":\"audio\",\"audio\":\"" + encoded + "\"}";
+                send_xai(event.c_str());
+            }
+            runtime().listening.store(false);
+            runtime().face.store(FaceState::Thinking);
+            send_xai("{\"type\":\"end_listen\"}");
+        }
+        flush_mic_to_xai();
+        play_some();
+        if (g_turn_done.load() && !pcm_pending() && !M5.Speaker.isPlaying()) {
+            send_xai("{\"type\":\"played\"}");
+            played = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGI(kTag, "HA turn %s", played ? "played" : "ended without playback confirmation");
+    runtime().listening.store(false);
+    g_want.store(false);
+    close_realtime();
+}
+
 void voice_task(void*)
 {
-    ESP_LOGW(kTag, "xAI voice task UNTESTED on hardware and against a live session");
+    DeviceConfig voice_config;
+    config_load(voice_config);
+    g_ha_mode.store(!voice_config.ha_url.empty());
+    ESP_LOGW(kTag, "voice transport: %s (HA path not hardware-tested)", g_ha_mode.load() ? "Home Assistant LAN" : "legacy xAI");
     for (;;) {
         SpeakItem next;
         bool have = false;
@@ -718,7 +819,7 @@ void voice_task(void*)
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        if (g_ack_beep.exchange(false)) {
+        if (g_ack_beep.exchange(false) && !g_ha_mode.load()) {
             // Immediate "I heard you" tone so the wait for /token is not silent.
             if (speaker_ready()) {
                 const bool toned = M5.Speaker.tone(1046, 110);
@@ -726,6 +827,15 @@ void voice_task(void*)
                 for (int i = 0; i < 20 && M5.Speaker.isPlaying(); ++i) vTaskDelay(pdMS_TO_TICKS(10));
             }
             runtime().speaking.store(false);
+        }
+        if (g_ha_mode.load()) {
+            if (have) {
+                // Asynchronous announcements need a separate TTS-only turn in a later slice.
+                ESP_LOGW(kTag, "HA unsolicited announcement not supported in this slice");
+                if (!runtime().listening.load()) g_want.store(false);
+            }
+            if (g_want.load()) ha_turn(voice_config);
+            continue;
         }
         if (g_xai == nullptr || !g_connected.load()) {
             if (g_xai != nullptr) {
@@ -891,9 +1001,14 @@ void speak_reply(const std::string& text, const std::string& request_id)
 
 void voice_start_turn()
 {
+    if (g_ha_mode.load() && g_want.load()) return; // no barge-in
     if (g_want.load()) g_interrupt.store(true);
+    runtime().session_deadline_us.store(esp_timer_get_time() + kMaxSessionUs);
     runtime().listening.store(true);
-    runtime().face.store(g_connected.load() ? FaceState::Listening : FaceState::Connecting);
+    DeviceConfig cfg;
+    if (config_load(cfg)) g_ha_mode.store(!cfg.ha_url.empty());
+    runtime().face.store(g_ha_mode.load() || g_connected.load() ? FaceState::Listening : FaceState::Connecting);
+    g_ha_end_requested.store(false);
     g_ack_beep.store(true);
     {
         std::lock_guard<std::mutex> lock(g_mic_send_mu);
@@ -905,6 +1020,10 @@ void voice_start_turn()
 
 void voice_stop_turn()
 {
+    if (g_ha_mode.load() && g_want.load()) {
+        g_ha_end_requested.store(true);
+        return;
+    }
     runtime().listening.store(false);
     if (!runtime().ptt.load()) g_want.store(false);
 }
@@ -912,9 +1031,14 @@ void voice_stop_turn()
 void voice_feed_pcm(const std::int16_t* pcm, std::size_t n)
 {
     if (pcm == nullptr || n == 0) return;
+    if (g_ha_mode.load() && !runtime().listening.load()) return;
     if (runtime().speaking.load()) return;
     if (!runtime().ptt.load() && !runtime().listening.load()) return;
     std::lock_guard<std::mutex> lock(g_mic_send_mu);
+    if (g_ha_mode.load() && g_mic_n + n > kMicSendCap) {
+        g_audio_failed.store(true);
+        return;
+    }
     for (std::size_t i = 0; i < n; ++i) mic_ring_push(pcm[i]);
 }
 

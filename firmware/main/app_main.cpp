@@ -21,6 +21,20 @@ namespace jarvis {
 namespace {
 constexpr const char* kTag = "jarvis";
 
+bool boot_setup_requested()
+{
+    // Existing robots can reopen setup without erasing NVS or using a command line.
+    // Hold the display during startup; consecutive samples reject a stray tap.
+    unsigned held = 0;
+    for (unsigned sample = 0; sample < 60; ++sample) {
+        M5.update();
+        held = M5.Touch.getCount() > 0 ? held + 1 : 0;
+        if (held >= 40) return true;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
 void ptt_task(void*)
 {
     stackchan::board::Si12tTouch* touch = nullptr;
@@ -59,10 +73,14 @@ extern "C" void app_main(void)
     if (!clock_sync()) ESP_LOGW(kTag, "clock not synced; the Worker will reject signatures until it is");
 
     eye_start();
+    if (boot_setup_requested()) {
+        portal_start();
+        return;
+    }
     privacy_start();
     head_start();
     DeviceConfig cfg;
-    if (config_load(cfg)) worker_ws_start(cfg);
+    if (config_load(cfg) && cfg.ha_url.empty()) worker_ws_start(cfg);
     wake_start();
     xTaskCreatePinnedToCore(ptt_task, "ptt", 4096, nullptr, 4, nullptr, 1);
     camera_gate().close();

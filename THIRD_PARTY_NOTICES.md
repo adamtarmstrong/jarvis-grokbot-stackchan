@@ -1,6 +1,6 @@
 # Third-party notices
 
-Jarvis is a personal, non-commercial hobby project. Our own code is MIT (`LICENSE`). The pieces below keep their own licenses. Do not strip those notices when you move a file.
+Jarvis is a personal, non-commercial hobby project. Our own firmware and Worker code are MIT (`LICENSE`). The separate `homeassistant/jarvis-bridge` application is GPL-3.0-or-later; see its LICENSE and THIRD_PARTY_NOTICES.md. The pieces below keep their own licenses. Do not strip those notices when you move a file.
 
 ## groki-bot
 

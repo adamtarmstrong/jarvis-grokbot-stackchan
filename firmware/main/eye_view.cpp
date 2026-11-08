@@ -77,6 +77,27 @@ void eye_task(void*)
             draw_shape(M5.Display, 230, 120, face.right, color, lip);
         }
         privacy_paint_dots();
+        // Visual turn cues, top-left: never overlap the eyes, top-right privacy dots, or y=0 bar.
+        M5.Display.fillRect(6, 6, 20, 22, bg);
+        if (g_runtime.session_deadline_us.load() > 0) {
+            const bool ready = g_runtime.listening.load() && !g_runtime.speaking.load();
+            const uint16_t status = ready ? rgb565(Rgb{96, 255, 144}) : rgb565(Rgb{255, 196, 72});
+            if (ready) {
+                // Microphone = speak now; local buffering starts at wake, not after a chime.
+                M5.Display.drawRoundRect(12, 8, 7, 11, 3, status);
+                M5.Display.drawLine(9, 15, 9, 19, status);
+                M5.Display.drawLine(22, 15, 22, 19, status);
+                M5.Display.drawLine(9, 19, 15, 23, status);
+                M5.Display.drawLine(22, 19, 15, 23, status);
+                M5.Display.drawLine(15, 23, 15, 26, status);
+                M5.Display.drawLine(11, 26, 19, 26, status);
+            } else {
+                // Clock = thinking, awaiting Jarvis, or playing the reply.
+                M5.Display.drawCircle(16, 17, 8, status);
+                M5.Display.drawLine(16, 17, 16, 11, status);
+                M5.Display.drawLine(16, 17, 21, 20, status);
+            }
+        }
         {
             constexpr int kBarH = 2;
             const std::int64_t deadline = g_runtime.session_deadline_us.load();

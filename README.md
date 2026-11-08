@@ -1,15 +1,28 @@
 # Jarvis
 
-Jarvis is a hobby voice robot for the M5Stack StackChan K151 (CoreS3, ESP32-S3). The robot talks to an [xAI](https://docs.x.ai/docs/guides/voice/agent) realtime voice session and, for anything that needs tools or another bot, to a Grok Bot webhook. A Cloudflare Worker sits between them. The xAI key never leaves the Worker.
+Jarvis is a hobby voice robot for the M5Stack StackChan K151 (CoreS3, ESP32-S3).
+
+**Current direction (Nov 8, 2026):** a [Home Assistant OS custom add-on](homeassistant/jarvis-bridge/README.md)
+runs local Whisper speech recognition and Piper Alan TTS, with the existing
+Cloudflare Worker routing text to the Jarvis Grok Bot webhook. Robot wake capture
+is immediate, with corner ready/busy icons instead of beeps. See
+[installation and status](docs/home-assistant-voice.md). This is an experimental
+local slice, not a deployed or hardware-validated release.
+
+The older xAI realtime path remains in the tree for compatibility when no HA
+bridge URL is configured; its original setup documentation below is historical.
+When HA is configured, it never mints an xAI token or falls back to that path.
 
 This tree is meant to be published. It contains no real keys, account ids, webhook ids, or Wi-Fi names. Setup for your own accounts is `docs/setup.md`.
 
-Our code is MIT. groki-bot firmware pieces are BSL-1.0, the zongzhu eye model is MIT, and the unused Emotion Ball eye data is non-commercial. See `THIRD_PARTY_NOTICES.md`.
+Our firmware and Worker code are MIT; the separate Home Assistant bridge is GPL-3.0-or-later. groki-bot firmware pieces are BSL-1.0, the zongzhu eye model is MIT, and the unused Emotion Ball eye data is non-commercial. See `THIRD_PARTY_NOTICES.md`.
 
 ## What is here
 
 | Path | Role |
 | --- | --- |
+| `homeassistant/jarvis-bridge/` | Custom add-on: local STT, webhook relay, Piper, LAN WebSocket. |
+| `repository.yaml` | Supervisor custom repository metadata. |
 | `worker/` | Cloudflare Worker and Durable Object. Device HMAC, one-time reply tokens, xAI client secrets, caps. |
 | `bot/WEBHOOK_ROUTINE.md` | Text to paste into the Jarvis Grok Bot webhook routine. |
 | `docs/setup.md` | Ten-step setup. |
