@@ -401,7 +401,7 @@ async def serve():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     LOG.setLevel(logging.INFO)
     # Third-party debug logs can contain text, phonemes, or signed URLs.
     for name in ("aiohttp", "piper", "faster_whisper", "httpx", "huggingface_hub"):
