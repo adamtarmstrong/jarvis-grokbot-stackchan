@@ -23,7 +23,7 @@ OPTIONS = {"bridge_key": "test-pairing-not-a-real-secret", "worker_url": "https:
            "reply_timeout": 2, "bind_port": 10700, "stt_model": "tiny.en", "piper_voice": bridge.ALAN}
 START = {"type": "start_listen", "sample_rate": 16000, "channels": 1, "format": "s16le"}
 HEADERS = {"X-Jarvis-Bridge-Key": OPTIONS["bridge_key"]}
-VOICE = struct.pack("<800h", *([1500] * 800))
+VOICE = struct.pack("<800h", *([5000] * 800))  # above Endpointing.VOICE_RMS (2500)
 SILENCE = bytes(1600)
 
 
@@ -48,6 +48,10 @@ class UnitTests(unittest.TestCase):
         expected = hmac.new(OPTIONS["hmac_key"].encode(), canonical.encode(), hashlib.sha256).hexdigest()
         self.assertEqual(result["X-Jarvis-Signature"], expected)
 
+    def test_turn_budget_covers_reply_timeout(self):
+        self.assertGreaterEqual(bridge.TURN_SECONDS, 120)
+        self.assertGreater(bridge.TURN_SECONDS, 50)  # max reply_timeout schema
+
     def test_options_fail_closed(self):
         bridge.validate_options(OPTIONS)
         for overrides in ({"bridge_key": ""}, {"worker_url": "http://bad"}, {"hmac_key": ""},
@@ -57,10 +61,10 @@ class UnitTests(unittest.TestCase):
 
     def test_endpoint_pause_and_bounds(self):
         endpoint = bridge.Endpointing()
-        # Warm past the 1.5 s no-silence-end guard, then speak and pause.
-        for _ in range(30):
+        # Warm past the 1.0 s grace, then pause ~1.2 s of silence to end.
+        for _ in range(20):
             self.assertFalse(endpoint.append(VOICE))
-        for _ in range(17):
+        for _ in range(23):
             self.assertFalse(endpoint.append(SILENCE))
         self.assertTrue(endpoint.append(SILENCE))
         for data in (b"x", b"", bytes(3202)):
@@ -253,11 +257,32 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_timeout(self):
         self.omit_reply = True
         self.options["reply_timeout"] = 0.05
-        ws = await self.connect()
-        await self.speak_and_end(ws)
-        self.assertEqual((await ws.receive_json())["type"], "processing")
-        self.assertEqual((await ws.receive_json())["type"], "error")
-        await ws.close()
+        with self.assertLogs("jarvis", level="WARNING") as logs:
+            ws = await self.connect()
+            await self.speak_and_end(ws)
+            self.assertEqual((await ws.receive_json())["type"], "processing")
+            self.assertEqual((await ws.receive_json())["type"], "error")
+            await ws.close()
+        joined = "\n".join(logs.output)
+        self.assertIn("reply_wait_timeout", joined)
+        self.assertNotIn("turn_budget_timeout", joined)
+
+    async def test_turn_timing_log_on_success(self):
+        with self.assertLogs("jarvis", level="WARNING") as logs:
+            ws = await self.connect()
+            await self.speak_and_end(ws)
+            self.assertEqual((await ws.receive_json())["type"], "processing")
+            while (await ws.receive_json())["type"] != "response.done":
+                pass
+            await ws.send_json({"type": "played"})
+            await ws.receive()
+        joined = "\n".join(logs.output)
+        self.assertIn("turn timing listen=", joined)
+        self.assertIn("stt=", joined)
+        self.assertIn("ask=", joined)
+        self.assertIn("jarvis_wait=", joined)
+        self.assertIn("tts_first_audio=", joined)
+        self.assertIn("total=", joined)
 
     async def test_direct_callback_one_time_and_expiry(self):
         future = asyncio.get_running_loop().create_future()

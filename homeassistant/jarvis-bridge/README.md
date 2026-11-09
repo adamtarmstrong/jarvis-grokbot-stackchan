@@ -33,9 +33,12 @@ this change, so GitHub installation becomes available only after a reviewed rele
      concurrently: the Worker permits one socket and replaces an older connection.
      In HA mode the firmware does not start its legacy Worker socket.
 5. `reply_timeout` defaults to 40 seconds. The *entire robot turn* has a hard
-   60-second limit including connect, speech input, STT, bot wait, TTS and playback.
-   A timeout ends the turn; slow/long bot tasks and delayed announcements are not
-   handled by this first slice. Ask Jarvis for concise answers.
+   120-second limit including connect, speech input, STT, bot wait, TTS and playback.
+   Timeouts name the cause in the log (`reply_wait_timeout` vs `turn_budget_timeout`).
+   Slow/long bot tasks and delayed announcements are not handled by this first slice.
+   Ask Jarvis for concise answers. Each finished turn also logs a WARNING timing line
+   (`listen` / `stt` / `ask` / `jarvis_wait` / `tts_first_audio` / `total`) with no
+   transcript text.
 6. Keep `bind_port: 10700` (the internal container port). In the add-on's Network
    section map `10700/tcp` to the LAN host port you want, default 10700. Do not
    forward this port on your router. Restrict it to the robot/trusted LAN.
@@ -139,6 +142,12 @@ No iOS app is planned. Asynchronous bot announcements and offline/late reply
 recovery through local Piper need a follow-up slice.
 
 ## Changelog
+
+### 0.1.3
+- Raise the whole-turn budget from 60 s to 120 s so a long listen plus
+  `reply_timeout` no longer aborts while Jarvis is still answering.
+- Distinguish `reply_wait_timeout` from `turn_budget_timeout` in the turn-ended log.
+- Log one WARNING `turn timing` line per turn (listen/stt/ask/jarvis_wait/tts_first_audio/total).
 
 ### 0.1.2
 - Fix log redaction inserting `***` between every character when an empty secret
