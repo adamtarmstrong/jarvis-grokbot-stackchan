@@ -57,7 +57,8 @@ class UnitTests(unittest.TestCase):
 
     def test_endpoint_pause_and_bounds(self):
         endpoint = bridge.Endpointing()
-        for _ in range(4):
+        # Warm past the 1.5 s no-silence-end guard, then speak and pause.
+        for _ in range(30):
             self.assertFalse(endpoint.append(VOICE))
         for _ in range(17):
             self.assertFalse(endpoint.append(SILENCE))
@@ -82,6 +83,19 @@ class UnitTests(unittest.TestCase):
             (root / "escape.onnx.json").touch()
             with self.assertRaises(ValueError):
                 bridge.private_model("escape", root)
+
+
+    def test_redact_skips_empty_and_short_secrets(self):
+        options = {**OPTIONS, "webhook_key": "", "bridge_key": "x"}
+        reason = bridge.redact_reason("worker request rejected status=502 reason=upstream_failed", options)
+        self.assertEqual(reason, "worker request rejected status=502 reason=upstream_failed")
+        self.assertNotIn("***w***", reason)
+
+    def test_redact_masks_long_secrets(self):
+        options = {**OPTIONS, "webhook_key": "test-webhook-not-real"}
+        reason = bridge.redact_reason("leak test-webhook-not-real here", options)
+        self.assertEqual(reason, "leak *** here")
+
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -150,8 +164,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.options.update(worker_url="", webhook_url=str(self.worker_server.make_url("/webhook")),
                             webhook_key="test-webhook-not-real", public_reply_url=str(self.client.make_url("/bot/reply")))
         ws = await self.connect()
-        await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
-        await ws.send_json({"type": "end_listen"})
+        await self.speak_and_end(ws)
         self.assertEqual((await ws.receive_json())["type"], "processing")
         while (await ws.receive_json())["type"] != "response.done":
             pass
@@ -169,6 +182,13 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         await ws.close()
         self.assertEqual(self.requests, [])
 
+
+    async def speak_and_end(self, ws):
+        # RATE bytes (~0.5 s) required after end_listen; one VOICE frame is only 1600 B.
+        for _ in range(12):
+            await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
+        await ws.send_json({"type": "end_listen"})
+
     async def connect(self):
         ws = await self.client.ws_connect("/voice", headers=HEADERS)
         await ws.send_json(START)
@@ -177,8 +197,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_pcm_roundtrip_and_played_ack(self):
         ws = await self.connect()
-        await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
-        await ws.send_json({"type": "end_listen"})
+        await self.speak_and_end(ws)
         self.assertEqual((await ws.receive_json())["type"], "processing")
         self.assertEqual((await ws.receive_json())["type"], "play")
         audio = await ws.receive_json()
@@ -190,13 +209,13 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         await ws.receive()
         await asyncio.wait_for(self.played_ack.wait(), 1)
         self.assertEqual(self.requests, [{"text": "Test request"}])
-        self.assertEqual(self.speech.input, VOICE)
+        self.assertEqual(self.speech.input, VOICE * 12)
         self.assertEqual(self.speech.reply, "Test answer")
         self.assertEqual([event["state"] for event in self.acks], ["received", "played"])
 
     async def test_pause_automatically_ends_input(self):
         ws = await self.connect()
-        for data in [VOICE] * 4 + [SILENCE] * 18:
+        for data in [VOICE] * 30 + [SILENCE] * 18:
             await ws.send_json({"type": "audio", "audio": base64.b64encode(data).decode()})
         self.assertEqual((await ws.receive_json())["type"], "processing")
         while (await ws.receive_json())["type"] != "response.done":
@@ -219,20 +238,23 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_rejection_never_falls_back(self):
         self.fail_ask = True
-        ws = await self.connect()
-        await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
-        await ws.send_json({"type": "end_listen"})
-        self.assertEqual((await ws.receive_json())["type"], "processing")
-        self.assertEqual((await ws.receive_json())["type"], "error")
-        self.assertIsNone(self.speech.reply)
-        await ws.close()
+        with self.assertLogs("jarvis", level="WARNING") as logs:
+            ws = await self.connect()
+            await self.speak_and_end(ws)
+            self.assertEqual((await ws.receive_json())["type"], "processing")
+            self.assertEqual((await ws.receive_json())["type"], "error")
+            self.assertIsNone(self.speech.reply)
+            await ws.close()
+        joined = "\n".join(logs.output)
+        self.assertIn("status=401", joined)
+        self.assertIn("reason=auth_failed", joined)
+        self.assertNotIn("***w***", joined)
 
     async def test_reply_timeout(self):
         self.omit_reply = True
         self.options["reply_timeout"] = 0.05
         ws = await self.connect()
-        await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
-        await ws.send_json({"type": "end_listen"})
+        await self.speak_and_end(ws)
         self.assertEqual((await ws.receive_json())["type"], "processing")
         self.assertEqual((await ws.receive_json())["type"], "error")
         await ws.close()

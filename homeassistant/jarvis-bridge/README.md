@@ -138,6 +138,17 @@ sleeps after 17:00. Voice must remain usable after hours when that work lands.
 No iOS app is planned. Asynchronous bot announcements and offline/late reply
 recovery through local Piper need a follow-up slice.
 
+## Changelog
+
+### 0.1.2
+- Fix log redaction inserting `***` between every character when an empty secret
+  (common in Worker mode where `webhook_key` is unused) was passed to `str.replace`.
+- Worker `/ask` rejections now log HTTP status and a short reason class
+  (`auth_failed`, `upstream_failed`, `rate_limited`, etc.) without bodies or tokens.
+
+### 0.1.1
+- Initial experimental add-on slice (STT, Piper Alan, Worker relay / direct webhook).
+
 ## Development checks
 
 ```sh

@@ -42,6 +42,47 @@ def worker_headers(options, method, path, body=b"", *, timestamp=None, nonce=Non
             "X-Jarvis-Timestamp": timestamp, "X-Jarvis-Nonce": nonce, "X-Jarvis-Signature": signature}
 
 
+
+WORKER_STATUS_REASON = {
+    400: "bad_request",
+    401: "auth_failed",
+    404: "not_found",
+    409: "duplicate",
+    429: "rate_limited",
+    500: "server_error",
+    502: "upstream_failed",
+}
+
+
+async def worker_reject_message(response):
+    """Build a log-safe rejection summary. Worker bare responses have no body."""
+    code = WORKER_STATUS_REASON.get(response.status, "rejected")
+    detail = code
+    try:
+        raw = await response.read()
+        if raw and len(raw) <= 256 and response.content_type and "json" in response.content_type:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                candidate = payload.get("reason") or payload.get("error") or payload.get("code")
+                if isinstance(candidate, str) and candidate.replace("_", "").isalnum() and len(candidate) <= 32:
+                    detail = candidate
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return f"worker request rejected status={response.status} reason={detail}"
+
+
+def redact_reason(reason, options):
+    """Strip credentials from exception text. Skip empty/short secrets (''.replace inserts ***)."""
+    text = str(reason).split("://")[0]
+    for key in ("bridge_key", "device_token", "hmac_key", "webhook_key"):
+        secret = options.get(key) or ""
+        if len(secret) >= 8:
+            text = text.replace(secret, "***")
+    if len(text) > 120:
+        text = text[:120]
+    return text
+
+
 class WorkerRelay:
     """Use the existing Worker /ask -> webhook -> /bot/reply -> /ws route."""
     def __init__(self, options, session):
@@ -59,7 +100,7 @@ class WorkerRelay:
         async with self.session.post(url, data=body, allow_redirects=False,
                 headers={**worker_headers(self.options, "POST", urlsplit(url).path, body), "Content-Type": "application/json"}) as response:
             if response.status != 200:
-                raise RuntimeError("worker request rejected")
+                raise RuntimeError(await worker_reject_message(response))
             self.request_id = (await response.json())["request_id"]
         async with asyncio.timeout(self.options["reply_timeout"]):
             async for message in self.socket:
@@ -298,13 +339,7 @@ class Bridge:
                         break
         except (Exception, asyncio.CancelledError) as error:
             # Log the class and a redacted reason. Never log URLs, tokens, or bodies.
-            reason = str(error).split("://")[0]
-            reason = reason.replace(self.options.get("bridge_key", ""), "***")
-            reason = reason.replace(self.options.get("device_token", ""), "***")
-            reason = reason.replace(self.options.get("hmac_key", ""), "***")
-            reason = reason.replace(self.options.get("webhook_key", ""), "***")
-            if len(reason) > 120:
-                reason = reason[:120]
+            reason = redact_reason(error, self.options)
             LOG.warning("turn ended (%s: %s)", type(error).__name__, reason or "no message")
             if ws.prepared and not ws.closed:
                 try:
