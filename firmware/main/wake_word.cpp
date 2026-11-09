@@ -9,6 +9,7 @@
 #include "runtime.hpp"
 #include "gates.hpp"
 
+#include <atomic>
 #include <cstdint>
 
 #include <freertos/FreeRTOS.h>
@@ -34,6 +35,7 @@ constexpr const char* kTag = "wake";
 
 const esp_afe_sr_iface_t* g_afe = nullptr;
 esp_afe_sr_data_t* g_afe_data = nullptr;
+std::atomic<bool> g_wake_request{false};
 
 void feed_task(void*)
 {
@@ -87,46 +89,55 @@ void feed_task(void*)
         }
         g_afe->feed(g_afe_data, buf);
         if (runtime().ptt.load() || runtime().listening.load()) voice_feed_pcm(buf, static_cast<std::size_t>(chunk));
+        // voice_start_turn reads NVS (flash). That cannot run on a PSRAM task stack
+        // (cache-disable assert). Detect only sets the flag; we start the turn here.
+        if (g_wake_request.exchange(false)) {
+            if (!(runtime().listening.load() || runtime().speaking.load() || runtime().ptt.load())) {
+                voice_start_turn();
+            } else {
+                ESP_LOGI(kTag, "wake word ignored; turn already open");
+            }
+        }
     }
 }
 
 void detect_task(void*)
 {
     std::int64_t last_ms = 0;
+    std::int64_t last_vol_ms = 0;
     for (;;) {
         afe_fetch_result_t* result = g_afe->fetch(g_afe_data);
         if (result == nullptr) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (result->wakeup_state != WAKENET_DETECTED) continue;
-        const std::int64_t now = esp_timer_get_time() / 1000;
-        if (now - last_ms < 1500) continue;
-        last_ms = now;
-        // A turn is already open (connecting, listening, or replying). Saying "Jarvis" again
-        // must not restart it or eat the question.
-        if (runtime().listening.load() || runtime().speaking.load() || runtime().ptt.load()) {
-            ESP_LOGI(kTag, "wake word ignored; turn already open");
-            continue;
+        const std::int64_t now_ms = esp_timer_get_time() / 1000;
+        // Integer-only diagnostics (float printf is stack-heavy on the detect task).
+        if (now_ms - last_vol_ms > 2000) {
+            last_vol_ms = now_ms;
+            const int vol_x10 = static_cast<int>(result->data_volume * 10.0f);
+            const int ring_x100 = static_cast<int>(result->ringbuff_free_pct * 100.0f);
+            if (vol_x10 > -450 || ring_x100 > 50) {
+                ESP_LOGI(kTag, "afe vol=%d.%d dBFS ring_free=%d%% vad=%d", vol_x10 / 10,
+                         (vol_x10 < 0 ? -vol_x10 : vol_x10) % 10, ring_x100, static_cast<int>(result->vad_state));
+            }
         }
+        if (result->wakeup_state != WAKENET_DETECTED) continue;
+        if (now_ms - last_ms < 1500) continue;
+        last_ms = now_ms;
+        // Do not call voice_start_turn here: it reads NVS/flash. With a PSRAM stack that
+        // trips esp_task_stack_is_sane_cache_disabled. Signal the feed task instead.
         ESP_LOGI(kTag, "wake word");
-        voice_start_turn();
+        g_wake_request.store(true);
     }
 }
 
 void start_tasks()
 {
-    static StaticTask_t feed_tcb;
-    static StaticTask_t detect_tcb;
-    constexpr int kFeedStack = 4096;
-    constexpr int kDetectStack = 6144;
-    auto* feed_stack = static_cast<StackType_t*>(heap_caps_malloc(kFeedStack, MALLOC_CAP_SPIRAM));
-    auto* detect_stack = static_cast<StackType_t*>(heap_caps_malloc(kDetectStack, MALLOC_CAP_SPIRAM));
-    if (feed_stack != nullptr && detect_stack != nullptr) {
-        xTaskCreateStaticPinnedToCore(feed_task, "wake_feed", kFeedStack, nullptr, 5, feed_stack, &feed_tcb, 0);
-        xTaskCreateStaticPinnedToCore(detect_task, "wake_det", kDetectStack, nullptr, 5, detect_stack, &detect_tcb, 1);
-        return;
-    }
+    // Stacks must be in internal RAM: voice_start_turn (from feed) and any flash/NVS
+    // path disable the cache, which asserts if the task stack lives in PSRAM.
+    constexpr int kFeedStack = 8192;
+    constexpr int kDetectStack = 8192;
     xTaskCreatePinnedToCore(feed_task, "wake_feed", kFeedStack, nullptr, 5, nullptr, 0);
     xTaskCreatePinnedToCore(detect_task, "wake_det", kDetectStack, nullptr, 5, nullptr, 1);
 }
@@ -152,7 +163,11 @@ void wake_start()
         return;
     }
     cfg->aec_init = false;
-    cfg->wakenet_mode = DET_MODE_90;
+    // StackChan board mic magnification defaults to 2; enable WakeNet-driven AGC and a
+    // slightly more sensitive detector so desk-distance "Hey Jarvis" still triggers.
+    cfg->agc_init = true;
+    cfg->agc_mode = AFE_AGC_MODE_WAKENET;
+    cfg->wakenet_mode = DET_MODE_95;
     cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     cfg->pcm_config.total_ch_num = 1;
     cfg->pcm_config.mic_num = 1;

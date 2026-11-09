@@ -90,7 +90,7 @@ The GitHub Action `.github/workflows/firmware.yml` builds with `espressif/idf:v5
 
 ## 5. First-run setup
 
-On a chip with empty NVS the firmware opens a setup access point named `Jarvis-Setup` (open, no password) and a page at `http://192.168.4.1/`. It also starts BLE provisioning under the name `Jarvis`. The serial log prints a one-boot proof-of-possession for BLE. That line is a setup PIN, not a cloud key.
+On a chip with empty NVS the firmware opens a setup access point named `Jarvis-Setup` (open, no password) and a page at `http://192.168.44.1/`. It also starts BLE provisioning under the name `Jarvis`. The serial log prints a one-boot proof-of-possession for BLE. That line is a setup PIN, not a cloud key.
 
 The page asks for the Wi-Fi name and password, the Worker URL (`PUBLIC_BASE_URL`), the path prefix, the device id, the device token (the raw token, not the hash), and the HMAC key. Those values are stored in NVS. They are not compiled in.
 

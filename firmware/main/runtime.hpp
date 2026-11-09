@@ -45,6 +45,7 @@ struct Runtime {
 Runtime& runtime();
 
 void eye_start();
+void eye_run();
 void privacy_start();
 // Draws the privacy dots. Call only from the eye task, which owns M5.Display.
 void privacy_paint_dots();

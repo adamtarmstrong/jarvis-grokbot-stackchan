@@ -18,7 +18,7 @@ These cover the HMAC vector, the canonical string, the brass accent, privacy dot
 - The 320×240 eye task (M5GFX). Priority is 1 on purpose
 - WakeNet `wn9_jarvis_tts` and the Kconfig symbol `CONFIG_SR_WN_WN9_JARVIS_TTS`
 - Hold-to-talk via the Si12T middle/back zones and the screen
-- Captive portal, DNS hijack to 192.168.4.1, and BLE provisioning (`WIFI_PROV_SECURITY_1`, proof-of-possession printed once at boot)
+- Captive portal, DNS hijack to 192.168.44.1, and BLE provisioning (`WIFI_PROV_SECURITY_1`, proof-of-possession printed once at boot)
 - SNTP, HMAC signatures against a deployed Worker, and the device WebSocket
 - xAI realtime: `session.update` voice placement, `server_vad`, PCM16 at 16 kHz, `ask_bot`, and read-back via `conversation.item.create`
 - OTA (`esp_https_ota`) and rollback. The Worker does not send an `ota` message in this version; the firmware accepts one if a later Worker does

@@ -755,21 +755,44 @@ void ha_turn(const DeviceConfig& cfg)
     const auto ready_deadline = esp_timer_get_time() + 10'000'000;
     bool ready = false;
     bool played = false;
+    std::int64_t handsfree_deadline_us = 0;
     while (started && g_connected.load() && !g_audio_failed.load()) {
         const auto now = esp_timer_get_time();
         const auto deadline = runtime().session_deadline_us.load();
         if (deadline == 0 || now >= deadline || (!ready && now > ready_deadline)) break;
         if (g_ready_beep.exchange(false)) {
-            // Visual-only readiness: speech has already been buffering since wake.
+            // Visual-only readiness. Drop audio captured during WS connect (wake remnant
+            // + silence) so the bridge does not endpoint before the real question.
             runtime().speaking.store(false);
             runtime().listening.store(true);
             runtime().face.store(FaceState::Listening);
             g_next_mic_send_us.store(0);
+            {
+                std::lock_guard<std::mutex> lock(g_mic_send_mu);
+                mic_ring_clear();
+            }
             g_ha_capturing.store(true);
             ready = true;
+            // PTT ends on finger release. Wake-word turns get a longer listen window so
+            // the user can ask after the listening cue.
+            constexpr std::int64_t kHaHandsfreeUs = 15'000'000;
+            if (!runtime().ptt.load()) {
+                handsfree_deadline_us = now + kHaHandsfreeUs;
+                ESP_LOGI(kTag, "HA hands-free listen window %d ms", static_cast<int>(kHaHandsfreeUs / 1000));
+            } else {
+                handsfree_deadline_us = 0;
+            }
+        }
+        if (ready && g_ha_capturing.load() && handsfree_deadline_us != 0) {
+            if (runtime().ptt.load()) {
+                handsfree_deadline_us = 0; // user took over with PTT; wait for release
+            } else if (now >= handsfree_deadline_us) {
+                g_ha_end_requested.store(true);
+                handsfree_deadline_us = 0;
+            }
         }
         if (ready && g_ha_end_requested.exchange(false) && g_ha_capturing.exchange(false)) {
-            // Drain mic tail on touch-release before ending input.
+            // Drain mic tail on touch-release / hands-free window before ending input.
             for (;;) {
                 std::int16_t chunk[800];
                 std::size_t n;

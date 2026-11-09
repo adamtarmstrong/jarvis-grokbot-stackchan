@@ -43,9 +43,10 @@ this change, so GitHub installation becomes available only after a reviewed rele
    Alan and Whisper are downloaded once to `/data/models`, then reused.
    `/health` reports readiness only after the models have loaded.
 8. Later, after the updated firmware is deliberately flashed, hold the robot's
-   screen during startup to reopen setup (hold for two seconds within the first
-   three seconds after the eyes appear). Join `Jarvis-Setup`, open
-   `http://192.168.4.1/`, and enter Wi-Fi, bridge URL
+   screen during startup to reopen setup (hold for two seconds within the
+   eight-second "Hold for setup" window after the display comes up; panel or
+   Si12T touch both count). Join `Jarvis-Setup`, open
+   `http://192.168.44.1/`, and enter Wi-Fi, bridge URL
    `ws://PI-LAN-IP:10700/voice`, and the matching bridge key. A reserved Pi IP is
    more reliable than mDNS. Legacy Worker fields may be empty in this mode.
    Save/reboot. Setup re-entry and the firmware path still require hardware testing.

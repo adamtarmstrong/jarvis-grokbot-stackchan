@@ -157,6 +157,11 @@ void eye_start()
     M5.Display.setBrightness(160);
     M5.Display.fillScreen(rgb565(kFaceBackground));
 
+    // Eye task starts after the setup-hold window so the cue stays visible.
+}
+
+void eye_run()
+{
     // UNTESTED on a panel. Priority 1 is deliberate; audio tasks use 5.
     xTaskCreatePinnedToCore(eye_task, "eyes", 4096, nullptr, 1, nullptr, 1);
 }

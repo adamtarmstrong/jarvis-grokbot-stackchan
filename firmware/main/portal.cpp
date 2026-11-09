@@ -2,9 +2,13 @@
 // Copyright (c) 2026 Jarvis contributors
 //
 // First-boot setup. The softAP name is the product name, not a user's network.
-// UNTESTED: captive portal, DNS hijack, and BLE provisioning were not run here.
+// UNTESTED: captive portal and DNS hijack were not run here.
+// SoftAP web setup only — BLE Wi-Fi provisioning is not started (it drops SoftAP).
 
 #include "link.hpp"
+#include "jarvis/privacy.hpp"
+
+#include <M5Unified.h>
 
 #include <cctype>
 #include <cstdio>
@@ -229,7 +233,7 @@ esp_err_t save_post(httpd_req_t* req)
 esp_err_t redirect_get(httpd_req_t* req)
 {
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.44.1/");
     return httpd_resp_send(req, "", 0);
 }
 
@@ -278,7 +282,7 @@ void dns_task(void*)
         buf[query_end + 11] = 0x04;
         buf[query_end + 12] = 192;
         buf[query_end + 13] = 168;
-        buf[query_end + 14] = 4;
+        buf[query_end + 14] = 44;
         buf[query_end + 15] = 1;
         sendto(sock, buf, query_end + 16, 0, reinterpret_cast<sockaddr*>(&from), from_len);
     }
@@ -316,19 +320,40 @@ void start_ble()
     if (err != ESP_OK) ESP_LOGW(kTag, "ble provisioning start failed");
 }
 
+void configure_ap_ip(esp_netif_t* ap_netif)
+{
+    // Home LANs often use 192.168.4.0/22 (gateway 192.168.4.1). Keep the setup
+    // SoftAP on a different subnet so captive redirects hit the robot, not the router.
+    if (ap_netif == nullptr) {
+        ESP_LOGE(kTag, "AP netif missing; SoftAP IP stays at the ESP-IDF default");
+        return;
+    }
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+    esp_netif_ip_info_t ip = {};
+    esp_netif_set_ip4_addr(&ip.ip, 192, 168, 44, 1);
+    esp_netif_set_ip4_addr(&ip.gw, 192, 168, 44, 1);
+    esp_netif_set_ip4_addr(&ip.netmask, 255, 255, 255, 0);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
+    ESP_LOGI(kTag, "SoftAP IP set to 192.168.44.1");
+}
+
 void start_radio()
 {
     ensure_stack();
+    esp_netif_t* ap_netif = nullptr;
     if (!g_wifi_ready) {
-        esp_netif_create_default_wifi_ap();
+        ap_netif = esp_netif_create_default_wifi_ap();
         esp_netif_create_default_wifi_sta();
         wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&init));
         g_wifi_ready = true;
     } else {
         esp_wifi_stop();
-        esp_netif_create_default_wifi_ap();
+        ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif == nullptr) ap_netif = esp_netif_create_default_wifi_ap();
     }
+    configure_ap_ip(ap_netif);
     wifi_config_t ap = {};
     std::strncpy(reinterpret_cast<char*>(ap.ap.ssid), kApSsid, sizeof(ap.ap.ssid));
     ap.ap.ssid_len = static_cast<std::uint8_t>(std::strlen(kApSsid));
@@ -341,10 +366,32 @@ void start_radio()
 }
 } // namespace
 
+void paint_setup_screen()
+{
+    // First-boot portal may run before eye_start; hold-to-setup already called M5.begin.
+    auto cfg = M5.config();
+    cfg.clear_display = false;
+    M5.begin(cfg);
+    M5.Display.setRotation(1);
+    M5.Display.setBrightness(160);
+    const uint16_t bg = M5.Display.color565(kFaceBackground.r, kFaceBackground.g, kFaceBackground.b);
+    M5.Display.fillScreen(bg);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(0xFFFF, bg);
+    const int cx = M5.Display.width() / 2;
+    const int cy = M5.Display.height() / 2;
+    M5.Display.drawString("Join Jarvis-Setup", cx, cy - 24);
+    M5.Display.drawString("http://192.168.44.1/", cx, cy + 24);
+}
+
 void portal_start()
 {
-    ESP_LOGW(kTag, "setup portal UNTESTED. Join the open network Jarvis-Setup, then open http://192.168.4.1/");
+    ESP_LOGW(kTag, "setup portal UNTESTED. Join the open network Jarvis-Setup, then open http://192.168.44.1/");
     start_radio();
+    // Do not call start_ble(): wifi_prov_scheme_ble releases BTDM memory and
+    // switches Wi-Fi to STA-only, which immediately tears down Jarvis-Setup SoftAP.
+    paint_setup_screen();
     xTaskCreate(dns_task, "dns", 4096, nullptr, 3, nullptr);
     httpd_config_t http = HTTPD_DEFAULT_CONFIG();
     http.uri_match_fn = httpd_uri_match_wildcard;
@@ -367,7 +414,6 @@ void portal_start()
         httpd_register_uri_handler(server, &save);
         httpd_register_uri_handler(server, &any);
     }
-    start_ble();
     for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
 }
 

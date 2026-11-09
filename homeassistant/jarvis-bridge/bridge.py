@@ -135,18 +135,24 @@ class Endpointing:
         self.audio = bytearray()
         self.voiced = 0
         self.silent = 0
+        self.frames = 0
 
     def append(self, data):
         import numpy as np
         if len(data) % 2 or not data or len(data) > 3200 or len(self.audio) + len(data) > MAX_AUDIO:
             raise ValueError("invalid audio")
         self.audio.extend(data)
+        self.frames += 1
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32)
         if float(np.sqrt(np.mean(samples * samples))) >= 400:
             self.voiced += len(samples)
             self.silent = 0
         else:
             self.silent += len(samples)
+        # Do not silence-end in the first ~1.5 s of audio; wake/connect tails and the
+        # user's pause before the question used to trip this immediately.
+        if len(self.audio) < int(RATE * 2 * 1.5):
+            return False
         return self.voiced >= RATE // 5 and self.silent >= int(RATE * 0.9)
 
 
@@ -263,10 +269,18 @@ class Bridge:
                     if not endpoint.voiced and time.monotonic() - started > 8:
                         raise ValueError("no speech")
                 await ws.send_json({"type": "processing"})
-                text = await inference(self.speech.transcribe, bytes(endpoint.audio))
-                if self.options.get("worker_url"):
+                if len(endpoint.audio) < RATE:  # < 0.5 s of PCM
+                    raise ValueError("audio too short")
+                try:
+                    text = await inference(self.speech.transcribe, bytes(endpoint.audio))
+                except ValueError:
+                    LOG.warning("turn ended (ValueError: empty transcript)")
+                    text = "I did not catch that. Please try again."
+                if self.options.get("worker_url") and text != "I did not catch that. Please try again.":
                     relay = WorkerRelay(self.options, self.session)
                     reply = await relay.ask(text)
+                elif self.options.get("worker_url"):
+                    reply = text
                 else:
                     reply = await self.replies.ask(self.options, self.session, text)
                 pcm = await inference(self.speech.synthesize, reply)
@@ -283,8 +297,15 @@ class Bridge:
                             await relay.ack("played")
                         break
         except (Exception, asyncio.CancelledError) as error:
-            # Exception messages can include secret endpoints; never stringify them.
-            LOG.warning("turn ended (%s)", type(error).__name__)
+            # Log the class and a redacted reason. Never log URLs, tokens, or bodies.
+            reason = str(error).split("://")[0]
+            reason = reason.replace(self.options.get("bridge_key", ""), "***")
+            reason = reason.replace(self.options.get("device_token", ""), "***")
+            reason = reason.replace(self.options.get("hmac_key", ""), "***")
+            reason = reason.replace(self.options.get("webhook_key", ""), "***")
+            if len(reason) > 120:
+                reason = reason[:120]
+            LOG.warning("turn ended (%s: %s)", type(error).__name__, reason or "no message")
             if ws.prepared and not ws.closed:
                 try:
                     await ws.send_json({"type": "error", "code": "turn_failed"})

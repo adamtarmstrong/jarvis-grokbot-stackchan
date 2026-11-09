@@ -14,6 +14,17 @@ bool MicGate::open()
     if (open_) return true;
     M5.Speaker.end();
     vTaskDelay(pdMS_TO_TICKS(20));
+    // M5Unified sets StackChan/CoreS3 magnification to 2. That is quiet for WakeNet at
+    // desk distance (idle peaks stay <500; close speech historically needs ~6k–11k).
+    // Raise gain before begin(); clamp stays inside Mic_Class.
+    {
+        auto cfg = M5.Mic.config();
+        if (cfg.magnification < 8) {
+            cfg.magnification = 8;
+            M5.Mic.config(cfg);
+            ESP_LOGI(kTag, "mic magnification set to %u", static_cast<unsigned>(cfg.magnification));
+        }
+    }
     if (!M5.Mic.begin()) {
         ESP_LOGW(kTag, "microphone did not start");
         open_ = false;
