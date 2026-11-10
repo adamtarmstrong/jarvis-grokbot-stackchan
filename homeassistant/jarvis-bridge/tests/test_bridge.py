@@ -51,6 +51,7 @@ class UnitTests(unittest.TestCase):
     def test_turn_budget_covers_reply_timeout(self):
         self.assertGreaterEqual(bridge.TURN_SECONDS, 120)
         self.assertGreater(bridge.TURN_SECONDS, 50)  # max reply_timeout schema
+        self.assertGreaterEqual(bridge.IDLE_SECONDS, 600)
 
     def test_options_fail_closed(self):
         bridge.validate_options(OPTIONS)
@@ -172,8 +173,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await ws.receive_json())["type"], "processing")
         while (await ws.receive_json())["type"] != "response.done":
             pass
-        await ws.send_json({"type": "played"})
-        await ws.receive()
+        await self.send_played(ws)
         self.assertEqual(self.speech.reply, "Direct test answer")
         self.assertEqual(self.direct_requests[0]["text"], "Test request")
         self.assertEqual(self.bridge.replies.pending, {})
@@ -199,6 +199,18 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await ws.receive_json())["type"], "ready")
         return ws
 
+    async def wait_until_idle(self, timeout=2):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self.bridge.busy:
+            if asyncio.get_running_loop().time() > deadline:
+                self.fail("bridge stayed busy after the turn")
+            await asyncio.sleep(0.01)
+
+    async def send_played(self, ws):
+        await ws.send_json({"type": "played"})
+        await self.wait_until_idle()
+        self.assertFalse(ws.closed)
+
     async def test_worker_pcm_roundtrip_and_played_ack(self):
         ws = await self.connect()
         await self.speak_and_end(ws)
@@ -209,8 +221,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await ws.receive_json())["type"], "response.done")
         # Already-buffered mic frames must not be mistaken for played confirmation.
         await ws.send_json({"type": "audio", "audio": "AAA="})
-        await ws.send_json({"type": "played"})
-        await ws.receive()
+        await self.send_played(ws)
         await asyncio.wait_for(self.played_ack.wait(), 1)
         self.assertEqual(self.requests, [{"text": "Test request"}])
         self.assertEqual(self.speech.input, VOICE * 12)
@@ -219,7 +230,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pause_automatically_ends_input(self):
         ws = await self.connect()
-        for data in [VOICE] * 30 + [SILENCE] * 18:
+        for data in [VOICE] * 30 + [SILENCE] * 26:
             await ws.send_json({"type": "audio", "audio": base64.b64encode(data).decode()})
         self.assertEqual((await ws.receive_json())["type"], "processing")
         while (await ws.receive_json())["type"] != "response.done":
@@ -274,8 +285,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await ws.receive_json())["type"], "processing")
             while (await ws.receive_json())["type"] != "response.done":
                 pass
-            await ws.send_json({"type": "played"})
-            await ws.receive()
+            await self.send_played(ws)
         joined = "\n".join(logs.output)
         self.assertIn("turn timing listen=", joined)
         self.assertIn("stt=", joined)
@@ -283,6 +293,49 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("jarvis_wait=", joined)
         self.assertIn("tts_first_audio=", joined)
         self.assertIn("total=", joined)
+
+    async def test_multi_turn_on_one_socket(self):
+        ws = await self.connect()
+        await self.speak_and_end(ws)
+        self.assertEqual((await ws.receive_json())["type"], "processing")
+        while (await ws.receive_json())["type"] != "response.done":
+            pass
+        await self.send_played(ws)
+        await ws.send_json(START)
+        self.assertEqual((await ws.receive_json())["type"], "ready")
+        await self.speak_and_end(ws)
+        self.assertEqual((await ws.receive_json())["type"], "processing")
+        while (await ws.receive_json())["type"] != "response.done":
+            pass
+        await self.send_played(ws)
+        self.assertEqual(self.requests, [{"text": "Test request"}, {"text": "Test request"}])
+        await ws.close()
+
+    async def test_stale_idle_socket_is_replaced(self):
+        idle = await self.client.ws_connect("/voice", headers=HEADERS)
+        self.assertFalse(idle.closed)
+        ws = await self.connect()
+        closed = await idle.receive()
+        self.assertTrue(idle.closed or closed.type.name in ("CLOSE", "CLOSING", "CLOSED"))
+        await self.speak_and_end(ws)
+        self.assertEqual((await ws.receive_json())["type"], "processing")
+        while (await ws.receive_json())["type"] != "response.done":
+            pass
+        await self.send_played(ws)
+        await ws.close()
+
+    async def test_idle_socket_does_not_block_second_connect_after_turn(self):
+        first = await self.connect()
+        await self.speak_and_end(first)
+        self.assertEqual((await first.receive_json())["type"], "processing")
+        while (await first.receive_json())["type"] != "response.done":
+            pass
+        await self.send_played(first)
+        second = await self.client.ws_connect("/voice", headers=HEADERS)
+        closed = await first.receive()
+        self.assertTrue(first.closed or closed.type.name in ("CLOSE", "CLOSING", "CLOSED"))
+        self.assertFalse(second.closed)
+        await second.close()
 
     async def test_direct_callback_one_time_and_expiry(self):
         future = asyncio.get_running_loop().create_future()

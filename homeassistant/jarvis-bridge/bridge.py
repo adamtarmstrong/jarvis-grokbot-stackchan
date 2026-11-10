@@ -21,6 +21,7 @@ RATE = 16000
 MAX_AUDIO = RATE * 2 * 20
 MAX_TEXT = 2000
 TURN_SECONDS = 120
+IDLE_SECONDS = 600  # keep a persistent /voice socket; close only after this much silence
 ALAN = "en_GB-alan-medium"
 ALAN_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/"
 LOG = logging.getLogger("jarvis")
@@ -298,123 +299,179 @@ async def inference(function, value):
             await task
 
 
+async def recv_event(ws, timeout):
+    """Next JSON event, or None if the client closed. Heartbeats are handled by aiohttp."""
+    message = await ws.receive(timeout=timeout)
+    if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+        return None
+    if message.type == WSMsgType.ERROR:
+        raise ConnectionError("socket error")
+    if message.type != WSMsgType.TEXT:
+        raise ValueError("audio required")
+    return json.loads(message.data)
+
+
 class Bridge:
     def __init__(self, options, speech, session):
         self.options, self.speech, self.session = options, speech, session
         self.busy = False
+        self.idle_ws = None
+        self.accept = asyncio.Lock()
         self.replies = DirectReplies()
 
     async def health(self, request):
         return web.json_response({"ready": True, "protocol": 1})
 
+    async def _run_turn(self, ws, start, timing):
+        relay = None
+        try:
+            async with asyncio.timeout(TURN_SECONDS):
+                if (start.get("type") != "start_listen" or start.get("sample_rate") != RATE
+                        or start.get("channels") != 1 or start.get("format") != "s16le"):
+                    raise ValueError("start_listen required")
+                await ws.send_json({"type": "ready", "sample_rate": RATE, "format": "s16le", "channels": 1})
+                endpoint = Endpointing()
+                listen_started = time.monotonic()
+                started = listen_started
+                while True:
+                    event = await recv_event(ws, 8 if not endpoint.voiced else 3)
+                    if event is None:
+                        raise ConnectionError("client closed")
+                    if event.get("type") == "end_listen":
+                        break
+                    if event.get("type") != "audio" or not isinstance(event.get("audio"), str):
+                        raise ValueError("audio required")
+                    data = base64.b64decode(event["audio"], validate=True)
+                    if endpoint.append(data) or len(endpoint.audio) >= MAX_AUDIO:
+                        break
+                    if not endpoint.voiced and time.monotonic() - started > 8:
+                        raise ValueError("no speech")
+                timing["listen"] = time.monotonic() - listen_started
+                await ws.send_json({"type": "processing"})
+                if len(endpoint.audio) < RATE:  # < 0.5 s of PCM
+                    raise ValueError("audio too short")
+                stt_started = time.monotonic()
+                try:
+                    text = await inference(self.speech.transcribe, bytes(endpoint.audio))
+                except ValueError:
+                    LOG.warning("turn ended (ValueError: empty transcript)")
+                    text = "I did not catch that. Please try again."
+                timing["stt"] = time.monotonic() - stt_started
+                if self.options.get("worker_url") and text != "I did not catch that. Please try again.":
+                    relay = WorkerRelay(self.options, self.session)
+                    reply = await relay.ask(text)
+                    timing["ask"] = getattr(relay, "ask_seconds", 0.0)
+                    timing["jarvis_wait"] = getattr(relay, "jarvis_wait_seconds", 0.0)
+                elif self.options.get("worker_url"):
+                    reply = text
+                else:
+                    reply = await self.replies.ask(self.options, self.session, text)
+                tts_started = time.monotonic()
+                pcm = await inference(self.speech.synthesize, reply)
+                await ws.send_json({"type": "play", "sample_rate": RATE, "format": "s16le", "channels": 1})
+                first_delta = True
+                for offset in range(0, len(pcm), 3200):
+                    await ws.send_json({"type": "response.output_audio.delta", "delta": base64.b64encode(pcm[offset:offset + 3200]).decode()})
+                    if first_delta:
+                        timing["tts_first_audio"] = time.monotonic() - tts_started
+                        first_delta = False
+                    await asyncio.sleep(0.09)
+                if first_delta:
+                    timing["tts_first_audio"] = time.monotonic() - tts_started
+                await ws.send_json({"type": "response.done"})
+                # Audio already in flight from the robot may follow processing. Drain it.
+                while True:
+                    event = await recv_event(ws, 10)
+                    if event is None:
+                        raise ConnectionError("client closed")
+                    if event.get("type") == "played":
+                        if relay:
+                            await relay.ack("played")
+                        break
+        except TimeoutError as error:
+            if str(error) == "reply_wait_timeout":
+                raise
+            raise TimeoutError("turn_budget_timeout") from error
+        finally:
+            if relay:
+                await relay.close()
+
     async def socket(self, request):
         supplied = request.headers.get("X-Jarvis-Bridge-Key", "")
         if not hmac.compare_digest(supplied.encode(), self.options["bridge_key"].encode()):
             return web.Response(status=401)
-        if self.busy:
-            return web.Response(status=409)
-        self.busy = True
+        async with self.accept:
+            if self.busy:
+                return web.Response(status=409)
+            stale = self.idle_ws
+            self.idle_ws = None
         ws = web.WebSocketResponse(max_msg_size=8192, heartbeat=20)
-        relay = None
-        timing = {"listen": 0.0, "stt": 0.0, "ask": 0.0, "jarvis_wait": 0.0, "tts_first_audio": 0.0, "total": 0.0}
-        try:
-            await ws.prepare(request)
-            turn_started = time.monotonic()
+        await ws.prepare(request)
+        if stale is not None and stale is not ws and not stale.closed:
             try:
-                async with asyncio.timeout(TURN_SECONDS):
-                    start = await ws.receive_json(timeout=10)
-                    if (start.get("type") != "start_listen" or start.get("sample_rate") != RATE
-                            or start.get("channels") != 1 or start.get("format") != "s16le"):
-                        raise ValueError("start_listen required")
-                    await ws.send_json({"type": "ready", "sample_rate": RATE, "format": "s16le", "channels": 1})
-                    endpoint = Endpointing()
-                    listen_started = time.monotonic()
-                    started = listen_started
-                    while True:
-                        event = await ws.receive_json(timeout=8 if not endpoint.voiced else 3)
-                        if event.get("type") == "end_listen":
-                            break
-                        if event.get("type") != "audio" or not isinstance(event.get("audio"), str):
-                            raise ValueError("audio required")
-                        data = base64.b64decode(event["audio"], validate=True)
-                        if endpoint.append(data) or len(endpoint.audio) >= MAX_AUDIO:
-                            break
-                        if not endpoint.voiced and time.monotonic() - started > 8:
-                            raise ValueError("no speech")
-                    timing["listen"] = time.monotonic() - listen_started
-                    await ws.send_json({"type": "processing"})
-                    if len(endpoint.audio) < RATE:  # < 0.5 s of PCM
-                        raise ValueError("audio too short")
-                    stt_started = time.monotonic()
-                    try:
-                        text = await inference(self.speech.transcribe, bytes(endpoint.audio))
-                    except ValueError:
-                        LOG.warning("turn ended (ValueError: empty transcript)")
-                        text = "I did not catch that. Please try again."
-                    timing["stt"] = time.monotonic() - stt_started
-                    if self.options.get("worker_url") and text != "I did not catch that. Please try again.":
-                        relay = WorkerRelay(self.options, self.session)
-                        reply = await relay.ask(text)
-                        timing["ask"] = getattr(relay, "ask_seconds", 0.0)
-                        timing["jarvis_wait"] = getattr(relay, "jarvis_wait_seconds", 0.0)
-                    elif self.options.get("worker_url"):
-                        reply = text
-                    else:
-                        reply = await self.replies.ask(self.options, self.session, text)
-                    tts_started = time.monotonic()
-                    pcm = await inference(self.speech.synthesize, reply)
-                    await ws.send_json({"type": "play", "sample_rate": RATE, "format": "s16le", "channels": 1})
-                    first_delta = True
-                    for offset in range(0, len(pcm), 3200):
-                        await ws.send_json({"type": "response.output_audio.delta", "delta": base64.b64encode(pcm[offset:offset + 3200]).decode()})
-                        if first_delta:
-                            timing["tts_first_audio"] = time.monotonic() - tts_started
-                            first_delta = False
-                        await asyncio.sleep(0.09)
-                    if first_delta:
-                        timing["tts_first_audio"] = time.monotonic() - tts_started
-                    await ws.send_json({"type": "response.done"})
-                    # Audio already in flight from the robot may follow processing. Drain it.
-                    while True:
-                        event = await ws.receive_json(timeout=10)
-                        if event.get("type") == "played":
-                            if relay:
-                                await relay.ack("played")
-                            break
-            except TimeoutError as error:
-                if str(error) == "reply_wait_timeout":
-                    raise
-                raise TimeoutError("turn_budget_timeout") from error
-            timing["total"] = time.monotonic() - turn_started
-            LOG.warning(
-                "turn timing listen=%.1fs stt=%.1fs ask=%.1fs jarvis_wait=%.1fs tts_first_audio=%.1fs total=%.1fs",
-                timing["listen"], timing["stt"], timing["ask"], timing["jarvis_wait"],
-                timing["tts_first_audio"], timing["total"],
-            )
-        except (Exception, asyncio.CancelledError) as error:
-            # Log the class and a redacted reason. Never log URLs, tokens, or bodies.
-            reason = redact_reason(error, self.options)
-            LOG.warning("turn ended (%s: %s)", type(error).__name__, reason or "no message")
-            if timing["total"] == 0.0 and "turn_started" in locals():
-                timing["total"] = time.monotonic() - turn_started
-            if any(timing[k] for k in ("listen", "stt", "ask", "jarvis_wait", "tts_first_audio", "total")):
-                LOG.warning(
-                    "turn timing listen=%.1fs stt=%.1fs ask=%.1fs jarvis_wait=%.1fs tts_first_audio=%.1fs total=%.1fs",
-                    timing["listen"], timing["stt"], timing["ask"], timing["jarvis_wait"],
-                    timing["tts_first_audio"], timing["total"],
-                )
-            if ws.prepared and not ws.closed:
+                await stale.close()
+            except ConnectionError:
+                pass
+        self.idle_ws = ws
+        try:
+            while not ws.closed:
+                self.idle_ws = ws
                 try:
-                    await ws.send_json({"type": "error", "code": "turn_failed"})
+                    start = await recv_event(ws, IDLE_SECONDS)
+                except TimeoutError:
+                    break
+                except (ConnectionError, json.JSONDecodeError, ValueError):
+                    if ws.closed:
+                        break
+                    try:
+                        await ws.send_json({"type": "error", "code": "turn_failed"})
+                    except ConnectionError:
+                        break
+                    continue
+                if start is None:
+                    break
+                self.busy = True
+                self.idle_ws = None
+                timing = {"listen": 0.0, "stt": 0.0, "ask": 0.0, "jarvis_wait": 0.0, "tts_first_audio": 0.0, "total": 0.0}
+                turn_started = time.monotonic()
+                try:
+                    await self._run_turn(ws, start, timing)
+                    timing["total"] = time.monotonic() - turn_started
+                    LOG.warning(
+                        "turn timing listen=%.1fs stt=%.1fs ask=%.1fs jarvis_wait=%.1fs tts_first_audio=%.1fs total=%.1fs",
+                        timing["listen"], timing["stt"], timing["ask"], timing["jarvis_wait"],
+                        timing["tts_first_audio"], timing["total"],
+                    )
+                except (Exception, asyncio.CancelledError) as error:
+                    reason = redact_reason(error, self.options)
+                    LOG.warning("turn ended (%s: %s)", type(error).__name__, reason or "no message")
+                    if timing["total"] == 0.0:
+                        timing["total"] = time.monotonic() - turn_started
+                    if any(timing[k] for k in ("listen", "stt", "ask", "jarvis_wait", "tts_first_audio", "total")):
+                        LOG.warning(
+                            "turn timing listen=%.1fs stt=%.1fs ask=%.1fs jarvis_wait=%.1fs tts_first_audio=%.1fs total=%.1fs",
+                            timing["listen"], timing["stt"], timing["ask"], timing["jarvis_wait"],
+                            timing["tts_first_audio"], timing["total"],
+                        )
+                    if ws.prepared and not ws.closed:
+                        try:
+                            await ws.send_json({"type": "error", "code": "turn_failed"})
+                        except ConnectionError:
+                            pass
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    if not ws.prepared or ws.closed:
+                        break
+                finally:
+                    self.busy = False
+        finally:
+            if self.idle_ws is ws:
+                self.idle_ws = None
+            if not ws.closed:
+                try:
+                    await ws.close()
                 except ConnectionError:
                     pass
-            if isinstance(error, asyncio.CancelledError):
-                raise
-        finally:
-            if relay:
-                await relay.close()
-            await ws.close()
-            self.busy = False
         return ws
 
     def app(self):

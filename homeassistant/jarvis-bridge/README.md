@@ -95,7 +95,7 @@ the payload's `reply_url` rather than a hardcoded old Worker URL.
 
 ## Wire protocol v1
 
-One WebSocket connection at `ws://PI-IP:HOST-PORT/voice` per turn, pairing header
+One persistent WebSocket at `ws://PI-IP:HOST-PORT/voice` (reused across turns; older firmware that closes after a turn still works), pairing header
 `X-Jarvis-Bridge-Key` (never put the key in the URL). Trusted LAN only: this first
 slice uses plain WebSocket, NOT encrypted transport. Do not expose it to WAN.
 Frames are small JSON text messages so ESP-IDF can reuse its existing decoder.
@@ -111,12 +111,14 @@ Frames are small JSON text messages so ESP-IDF can reuse its existing decoder.
 | Pi → robot | `{"type":"response.output_audio.delta","delta":"BASE64_PCM"}` repeatedly |
 | Pi → robot | `{"type":"response.done"}` (all PCM sent, not necessarily played yet) |
 | Robot → Pi | `{"type":"played"}` after the speaker drains; relay acknowledges played to Worker |
-| Pi → robot | `{"type":"error","code":"turn_failed"}` then close on failure |
+| Pi → robot | `{"type":"error","code":"turn_failed"}` (ends the turn; the socket stays open if it is still healthy) |
 
 Both ways PCM is signed little-endian int16 mono at 16kHz, no WAV header.
 Piper output is resampled to 16kHz. Output is bounded to 45s and sent in paced
-100ms chunks. One connected robot only (409 busy), 401 for a wrong pairing key,
-8KiB max JSON frames, 20s max capture and a 60s total turn budget. There is no
+100ms chunks. One active turn at a time (409 busy only while a turn is in progress; an idle
+socket is replaced if the robot reconnects). 401 for a wrong pairing key,
+8KiB max JSON frames, 20s max capture and a 120s total turn budget. Idle sockets
+are held for up to 10 minutes of silence and accept WebSocket pings. There is no
 barge-in, automatic xAI fallback, or raw transcript/audio logging/storage.
 Input endpointing uses 900ms below a fixed energy threshold after speech;
 Whisper also runs Silero VAD. Microphone threshold needs desk testing.
@@ -142,6 +144,16 @@ No iOS app is planned. Asynchronous bot announcements and offline/late reply
 recovery through local Piper need a follow-up slice.
 
 ## Changelog
+
+### 0.1.4
+- Keep the `/voice` WebSocket open after `played`, `response.done`, or a
+  per-turn error, and wait for the next `start_listen` on the same socket.
+- The busy lock is held only during an active turn, so an idle connection never
+  409s a real wake. A new connection while an older socket is idle is accepted
+  and the stale socket is closed (robot reconnect after a Wi-Fi drop).
+- Heartbeats stay on while idle; idle sockets time out after 10 minutes of
+  silence and close cleanly when the client disconnects.
+- Older firmware that closes after each turn remains compatible.
 
 ### 0.1.3
 - Raise the whole-turn budget from 60 s to 120 s so a long listen plus
