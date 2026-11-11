@@ -17,6 +17,8 @@ import uuid
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+import usage
+
 RATE = 16000
 MAX_AUDIO = RATE * 2 * 20
 MAX_TEXT = 2000
@@ -318,6 +320,7 @@ class Bridge:
         self.idle_ws = None
         self.accept = asyncio.Lock()
         self.replies = DirectReplies()
+        self.usage = usage.UsageStore()
 
     async def health(self, request):
         return web.json_response({"ready": True, "protocol": 1})
@@ -396,6 +399,33 @@ class Bridge:
             if relay:
                 await relay.close()
 
+    async def _send_usage(self, ws):
+        payload = self.usage.message()
+        if payload is None:
+            payload = usage.empty_waiting()
+        await ws.send_json(payload)
+
+    async def _push_usage_to_idle(self):
+        ws = self.idle_ws
+        if self.busy or ws is None or not ws.prepared or ws.closed:
+            return
+        try:
+            await self._send_usage(ws)
+        except ConnectionError:
+            pass
+
+    async def usage_loop(self):
+        while True:
+            try:
+                snapshot = await usage.fetch_snapshot(self.options, self.session)
+                accepted = self.usage.accept(snapshot) if snapshot else None
+                if accepted:
+                    await usage.publish_sensors(self.session, accepted)
+                    await self._push_usage_to_idle()
+            except Exception as error:
+                LOG.warning("usage poll failed error=%s", type(error).__name__)
+            await asyncio.sleep(3600)
+
     async def socket(self, request):
         supplied = request.headers.get("X-Jarvis-Bridge-Key", "")
         if not hmac.compare_digest(supplied.encode(), self.options["bridge_key"].encode()):
@@ -405,8 +435,12 @@ class Bridge:
                 return web.Response(status=409)
             stale = self.idle_ws
             self.idle_ws = None
-        ws = web.WebSocketResponse(max_msg_size=8192, heartbeat=20)
+        ws = web.WebSocketResponse(max_msg_size=65536, heartbeat=20)
         await ws.prepare(request)
+        try:
+            await self._send_usage(ws)
+        except ConnectionError:
+            pass
         if stale is not None and stale is not ws and not stale.closed:
             try:
                 await stale.close()
@@ -430,6 +464,12 @@ class Bridge:
                     continue
                 if start is None:
                     break
+                if start.get("type") == "usage_request":
+                    try:
+                        await self._send_usage(ws)
+                    except ConnectionError:
+                        break
+                    continue
                 self.busy = True
                 self.idle_ws = None
                 timing = {"listen": 0.0, "stt": 0.0, "ask": 0.0, "jarvis_wait": 0.0, "tts_first_audio": 0.0, "total": 0.0}
@@ -509,6 +549,7 @@ async def serve():
         LOG.info("Loading local speech models; first start may download official Alan and Whisper")
         speech = await Speech.load(options, session, data_dir)
         bridge = Bridge(options, speech, session)
+        poller = asyncio.create_task(bridge.usage_loop())
         runner = web.AppRunner(bridge.app(), access_log=None)
         await runner.setup()
         try:
@@ -516,6 +557,7 @@ async def serve():
             LOG.info("Local speech pipeline ready on port 10700")
             await asyncio.Event().wait()
         finally:
+            poller.cancel()
             await runner.cleanup()
 
 

@@ -4,6 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libstd
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bridge.py run.sh LICENSE THIRD_PARTY_NOTICES.md ./
+COPY bridge.py usage.py run.sh LICENSE THIRD_PARTY_NOTICES.md ./
 RUN chmod +x /app/run.sh
 CMD ["/app/run.sh"]

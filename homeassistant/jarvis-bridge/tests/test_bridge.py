@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
+import usage
 
 
 OPTIONS = {"bridge_key": "test-pairing-not-a-real-secret", "worker_url": "https://worker.invalid/prefix123",
@@ -121,7 +122,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.session = ClientSession()
         self.options = {**OPTIONS, "worker_url": str(self.worker_server.make_url("/prefix123"))}
         self.speech = SpeechStub()
+        self.usage_dir = tempfile.TemporaryDirectory()
         self.bridge = bridge.Bridge(self.options, self.speech, self.session)
+        self.bridge.usage = usage.UsageStore(self.usage_dir.name)
         self.client = TestClient(TestServer(self.bridge.app()))
         await self.client.start_server()
         # Only tests bypass public HTTPS endpoint validation for loopback fake servers.
@@ -130,6 +133,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.validation.stop()
+        self.usage_dir.cleanup()
         await self.client.close()
         await self.session.close()
         await self.worker_server.close()
@@ -181,6 +185,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrong_input_format_fails_before_webhook(self):
         ws = await self.client.ws_connect("/voice", headers=HEADERS)
+        await self.drain_usage(ws)
         await ws.send_json({**START, "sample_rate": 24000})
         self.assertEqual((await ws.receive_json())["type"], "error")
         await ws.close()
@@ -193,8 +198,14 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             await ws.send_json({"type": "audio", "audio": base64.b64encode(VOICE).decode()})
         await ws.send_json({"type": "end_listen"})
 
+    async def drain_usage(self, ws):
+        message = await ws.receive_json()
+        self.assertEqual(message["type"], "usage_snapshot")
+        return message
+
     async def connect(self):
         ws = await self.client.ws_connect("/voice", headers=HEADERS)
+        await self.drain_usage(ws)
         await ws.send_json(START)
         self.assertEqual((await ws.receive_json())["type"], "ready")
         return ws
@@ -313,6 +324,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_idle_socket_is_replaced(self):
         idle = await self.client.ws_connect("/voice", headers=HEADERS)
+        await self.drain_usage(idle)
         self.assertFalse(idle.closed)
         ws = await self.connect()
         closed = await idle.receive()
@@ -332,6 +344,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             pass
         await self.send_played(first)
         second = await self.client.ws_connect("/voice", headers=HEADERS)
+        await self.drain_usage(second)
         closed = await first.receive()
         self.assertTrue(first.closed or closed.type.name in ("CLOSE", "CLOSING", "CLOSED"))
         self.assertFalse(second.closed)
@@ -352,6 +365,44 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         future.cancel()
         self.bridge.replies.pending["direct"] = (digest, future)
         self.assertEqual((await self.client.post(url, json=body)).status, 401)
+
+
+    async def test_usage_snapshot_on_connect_and_request(self):
+        sample = {
+            "type": "usage_snapshot",
+            "schema": "stackchan.usage.v1",
+            "fetched_at": "2026-11-10T18:00:00-05:00",
+            "period": {"used_pct": 62, "resets_at": "2026-11-16T00:00:00-05:00", "on_demand": "off"},
+            "days": [{"d": "Mon", "used_pct": 7}],
+            "bots": [{
+                "id": "hulk", "name": "Hulk", "avatar_shape": "rounded_hexagon",
+                "avatar_color": "#1FCB72", "share_pct": 38, "routines": [], "days": [],
+            }],
+        }
+        self.assertIsNotNone(self.bridge.usage.accept(sample))
+        ws = await self.client.ws_connect("/voice", headers=HEADERS)
+        hello = await self.drain_usage(ws)
+        self.assertEqual(hello["period"]["used_pct"], 62)
+        self.assertEqual(hello["bots"][0]["name"], "Hulk")
+        await ws.send_json({"type": "usage_request"})
+        again = await self.drain_usage(ws)
+        self.assertEqual(again["fetched_at"], sample["fetched_at"])
+        await ws.send_json(START)
+        self.assertEqual((await ws.receive_json())["type"], "ready")
+        await self.speak_and_end(ws)
+        self.assertEqual((await ws.receive_json())["type"], "processing")
+        while (await ws.receive_json())["type"] != "response.done":
+            pass
+        await self.send_played(ws)
+        self.assertEqual(self.requests, [{"text": "Test request"}])
+        await ws.close()
+
+    async def test_usage_request_on_empty_cache_is_waiting(self):
+        ws = await self.client.ws_connect("/voice", headers=HEADERS)
+        hello = await self.drain_usage(ws)
+        self.assertTrue(hello.get("waiting"))
+        await ws.close()
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

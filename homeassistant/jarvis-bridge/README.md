@@ -112,12 +112,15 @@ Frames are small JSON text messages so ESP-IDF can reuse its existing decoder.
 | Pi → robot | `{"type":"response.done"}` (all PCM sent, not necessarily played yet) |
 | Robot → Pi | `{"type":"played"}` after the speaker drains; relay acknowledges played to Worker |
 | Pi → robot | `{"type":"error","code":"turn_failed"}` (ends the turn; the socket stays open if it is still healthy) |
+| Robot → Pi | `{"type":"usage_request"}` (idle only; asks for the latest cached usage snapshot) |
+| Pi → robot | `{"type":"usage_snapshot",...}` on connect, after `usage_request`, and when a new snapshot arrives while idle. `waiting: true` if none is cached yet. |
 
 Both ways PCM is signed little-endian int16 mono at 16kHz, no WAV header.
 Piper output is resampled to 16kHz. Output is bounded to 45s and sent in paced
 100ms chunks. One active turn at a time (409 busy only while a turn is in progress; an idle
 socket is replaced if the robot reconnects). 401 for a wrong pairing key,
-8KiB max JSON frames, 20s max capture and a 120s total turn budget. Idle sockets
+64KiB max JSON frames (usage snapshots need the extra room; audio frames stay
+small), 20s max capture and a 120s total turn budget. Idle sockets
 are held for up to 10 minutes of silence and accept WebSocket pings. There is no
 barge-in, automatic xAI fallback, or raw transcript/audio logging/storage.
 Input endpointing uses 900ms below a fixed energy threshold after speech;
@@ -130,6 +133,35 @@ clock means thinking/waiting/speaking. The existing top-right privacy dots and
 when the turn ends. The Grok eyes/squint/expressions and lip playback are retained.
 The legacy xAI path is still present if the bridge URL is left empty; it is not
 used or silently retried when the bridge URL is set.
+
+## Usage snapshots and Home Assistant sensors
+
+The add-on does not scrape Grok Bot usage itself. A routine on the owner's
+desktop posts a `stackchan.usage.v1` snapshot to the existing Worker
+(`POST /{prefix}/usage`). This add-on polls `GET /{prefix}/usage` on startup
+and once an hour, using the same device HMAC credentials as `/ask`. A
+successful snapshot is:
+
+- appended to `/data/usage/snapshots.jsonl` (90-day retention; identical
+  `fetched_at` values are not duplicated)
+- published to Home Assistant as sensors, so the recorder keeps history
+- sent to the robot over the persistent `/voice` socket
+
+`homeassistant_api: true` is required so the add-on can `POST` to
+`/core/api/states/...` with the Supervisor token. If that token is missing
+(for example in unit tests), sensor publish is skipped and the JSONL + robot
+path still work. Snapshots marked `_example: true` are ignored.
+
+Sensors (attributes include `fetched_at`; bot sensors also include `name`,
+`color`, and `shape`):
+
+| Entity | State |
+|---|---|
+| `sensor.grokbot_usage_used_pct` | Weekly percent used |
+| `sensor.grokbot_usage_resets_at` | Reset timestamp |
+| `sensor.grokbot_usage_on_demand` | `off`, `available`, or `active` |
+| `sensor.grokbot_usage_bot_<id>` | That bot's share of the week |
+| `sensor.grokbot_usage_routine_<bot>_<name>` | A listed routine's share of that bot |
 
 ## Settings and remaining work
 
@@ -144,6 +176,16 @@ No iOS app is planned. Asynchronous bot announcements and offline/late reply
 recovery through local Piper need a follow-up slice.
 
 ## Changelog
+
+### 0.1.5
+- Poll the Worker `GET /usage` endpoint hourly and on startup, store every
+  snapshot in `/data/usage/snapshots.jsonl` (90-day retention), and publish
+  Home Assistant usage sensors (`sensor.grokbot_usage_*`) including per-bot
+  color and shape attributes.
+- Send `usage_snapshot` to the robot on `/voice` connect, on `usage_request`,
+  and when a new snapshot arrives while the socket is idle. A missing cache
+  is advertised as `waiting: true`. Older firmware that ignores the message
+  keeps working.
 
 ### 0.1.4
 - Keep the `/voice` WebSocket open after `played`, `response.done`, or a
